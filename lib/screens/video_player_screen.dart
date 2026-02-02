@@ -17,9 +17,16 @@ import '../services/dictionary_service.dart';
 import '../services/database_service.dart';
 
 class VideoPlayerScreen extends StatefulWidget {
-  final AssetEntity videoFile;
+  final AssetEntity? videoFile;
+  final String? videoPath;
+  final int? initialPositionMs;
 
-  const VideoPlayerScreen({super.key, required this.videoFile});
+  const VideoPlayerScreen({
+    super.key,
+    this.videoFile,
+    this.videoPath,
+    this.initialPositionMs,
+  });
 
   @override
   State<VideoPlayerScreen> createState() => _VideoPlayerScreenState();
@@ -62,6 +69,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   bool _isLearningMode = false;
   String? _selectedWord;
   Duration _lastSubtitleSearchPosition = Duration.zero;
+  bool _isCurrentSentenceSaved = false;
 
   // Horizontal Gesture Seeking
   bool _isSeeking = false;
@@ -78,22 +86,41 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   Future<void> _initializePlayer() async {
-    final file = await widget.videoFile.file;
-    if (file == null) {
+    File? file;
+    if (widget.videoFile != null) {
+      file = await widget.videoFile!.file;
+    } else if (widget.videoPath != null) {
+      file = File(widget.videoPath!);
+    }
+
+    if (file == null || !file.existsSync()) {
       setState(() => _isLoading = false);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Video file not found')));
+      }
       return;
     }
 
     _controller = VideoPlayerController.file(file);
     await _controller!.initialize();
 
-    // Restore progress
-    final savedPosition = await _historyService.getProgress(
-      widget.videoFile.id,
-    );
-    if (savedPosition > 0 &&
-        savedPosition < _controller!.value.duration.inSeconds) {
-      await _controller!.seekTo(Duration(seconds: savedPosition));
+    final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
+
+    // Restore progress or jump to saved position
+    int startingPosition;
+    if (widget.initialPositionMs != null) {
+      startingPosition = widget.initialPositionMs! ~/ 1000;
+      await _controller!.seekTo(
+        Duration(milliseconds: widget.initialPositionMs!),
+      );
+    } else {
+      startingPosition = await _historyService.getProgress(videoId);
+      if (startingPosition > 0 &&
+          startingPosition < _controller!.value.duration.inSeconds) {
+        await _controller!.seekTo(Duration(seconds: startingPosition));
+      }
     }
 
     _controller!.play();
@@ -101,7 +128,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _controller!.setVolume(_playerVolume);
 
     // Save to history immediately when video starts
-    await _historyService.saveProgress(widget.videoFile.id, savedPosition);
+    await _historyService.saveProgress(videoId, startingPosition);
 
     // Load subtitles
     await _loadSubtitles();
@@ -456,7 +483,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
   Future<void> _loadSubtitles() async {
     try {
-      final videoFile = await widget.videoFile.file;
+      File? videoFile;
+      if (widget.videoFile != null) {
+        videoFile = await widget.videoFile!.file;
+      } else if (widget.videoPath != null) {
+        videoFile = File(widget.videoPath!);
+      }
+
       if (videoFile == null) return;
 
       // Auto-discover .srt file with same basename
@@ -499,6 +532,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       final sub = _subtitles![i];
       if (position >= sub.start && position <= sub.end) {
         if (_currentSubtitle != sub) {
+          _checkIfSentenceSaved(sub.text);
           setState(() {
             _currentSubtitle = sub;
             _currentSubtitleIndex = i;
@@ -512,8 +546,57 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     if (_currentSubtitle != null) {
       setState(() {
         _currentSubtitle = null;
+        _isCurrentSentenceSaved = false;
         // Don't reset index to 0, keep it for efficiency
       });
+    }
+  }
+
+  Future<void> _checkIfSentenceSaved(String sentence) async {
+    final isSaved = await DatabaseService().isSentenceSaved(sentence);
+    if (mounted) {
+      setState(() {
+        _isCurrentSentenceSaved = isSaved;
+      });
+    }
+  }
+
+  Future<void> _handleSaveSentence(String sentence) async {
+    final videoTitle =
+        widget.videoFile?.title ??
+        widget.videoPath?.split(Platform.pathSeparator).last ??
+        'Unknown Video';
+
+    File? videoFile;
+    if (widget.videoFile != null) {
+      videoFile = await widget.videoFile!.file;
+    } else if (widget.videoPath != null) {
+      videoFile = File(widget.videoPath!);
+    }
+
+    final videoPath = videoFile?.path;
+    final timestampMs = _controller?.value.position.inMilliseconds ?? 0;
+
+    await DatabaseService().saveSentence(
+      sentence: sentence,
+      videoTitle: videoTitle,
+      videoPath: videoPath,
+      timestampMs: timestampMs,
+    );
+
+    if (mounted) {
+      setState(() {
+        _isCurrentSentenceSaved = true;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Sentence Saved!'),
+          duration: Duration(seconds: 1),
+          backgroundColor: Color(0xFF00C853),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
     }
   }
 
@@ -868,7 +951,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   Future<void> _saveProgress() async {
     if (_controller != null && _controller!.value.isInitialized) {
       final position = _controller!.value.position.inSeconds;
-      await _historyService.saveProgress(widget.videoFile.id, position);
+      final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
+      await _historyService.saveProgress(videoId, position);
     }
   }
 
@@ -943,6 +1027,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                       selectedWord: _selectedWord,
                       onWordTap: _onWordTap,
                       onLongPress: _onSentenceLongPress,
+                      onSaveSentence: _handleSaveSentence,
+                      isSaved: _isCurrentSentenceSaved,
                     ),
 
                   // Controls Overlay
@@ -996,7 +1082,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          widget.videoFile.title ?? 'Video',
+                          widget.videoFile?.title ??
+                              widget.videoPath
+                                  ?.split(Platform.pathSeparator)
+                                  .last ??
+                              'Video',
                           style: const TextStyle(
                             color: Colors.white,
                             fontSize: 16,

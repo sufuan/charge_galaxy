@@ -8,6 +8,8 @@ class SubtitleOverlay extends StatelessWidget {
   final String? selectedWord;
   final Function(String)? onWordTap;
   final VoidCallback? onLongPress;
+  final Function(String)? onSaveSentence;
+  final bool isSaved;
 
   const SubtitleOverlay({
     super.key,
@@ -17,6 +19,8 @@ class SubtitleOverlay extends StatelessWidget {
     this.selectedWord,
     this.onWordTap,
     this.onLongPress,
+    this.onSaveSentence,
+    this.isSaved = false,
   });
 
   List<String> _tokenizeSubtitle(String text) {
@@ -43,9 +47,28 @@ class SubtitleOverlay extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
           margin: const EdgeInsets.symmetric(horizontal: 32),
-          child: isLearningMode
-              ? _buildInteractiveSubtitle()
-              : _buildStandardSubtitle(),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Flexible(
+                child: isLearningMode
+                    ? _buildInteractiveSubtitle()
+                    : _buildStandardSubtitle(),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                icon: Icon(
+                  isSaved ? Icons.bookmark : Icons.bookmark_border,
+                  color: isSaved ? const Color(0xFF00C853) : Colors.white70,
+                  size: 24,
+                ),
+                onPressed: () => onSaveSentence?.call(currentSubtitle!.text),
+              ),
+            ],
+          ),
         ),
       ),
     );
