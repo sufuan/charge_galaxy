@@ -1,0 +1,21 @@
+1
+00:00:01,000 --> 00:00:04,000
+Welcome to the interactive subtitle test.
+
+2
+00:00:05,000 --> 00:00:08,500
+Tap any word to see its definition.
+
+3
+00:00:09,000 --> 00:00:13,000
+This feature makes language learning
+much easier while watching videos.
+
+4
+00:00:14,000 --> 00:00:17,000
+The subtitles should sync perfectly
+with the video playback.
+
+5
+00:00:18,000 --> 00:00:21,000
+Try it out and enjoy learning!
