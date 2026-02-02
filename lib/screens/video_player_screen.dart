@@ -60,6 +60,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   double _subtitleTextSize = 18.0;
   bool _isLearningMode = false;
   String? _selectedWord;
+  Duration _lastSubtitleSearchPosition = Duration.zero;
 
   @override
   void initState() {
@@ -371,6 +372,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     }
 
     final position = _controller!.value.position;
+
+    // Reset index if we jumped backwards
+    if (position < _lastSubtitleSearchPosition) {
+      _currentSubtitleIndex = 0;
+    }
+    _lastSubtitleSearchPosition = position;
 
     // Efficient index tracker - start from last known position
     for (int i = _currentSubtitleIndex; i < _subtitles!.length; i++) {

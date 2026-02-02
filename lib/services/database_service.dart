@@ -1,6 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:async';
 
 class DatabaseService {
   static final DatabaseService _instance = DatabaseService._internal();
@@ -35,6 +36,10 @@ class DatabaseService {
     );
   }
 
+  // Stream to notify listeners of changes
+  final _historyStreamController = StreamController<void>.broadcast();
+  Stream<void> get onHistoryChanged => _historyStreamController.stream;
+
   // Fire and forget upsert
   Future<void> upsertWord(String word, String definition) async {
     try {
@@ -44,6 +49,7 @@ class DatabaseService {
         'INSERT OR REPLACE INTO vocabulary_history (word, definition, created_at) VALUES (?, ?, ?)',
         [word, definition, DateTime.now().millisecondsSinceEpoch],
       );
+      _historyStreamController.add(null);
       debugPrint('Saved to history: $word');
     } catch (e) {
       debugPrint('Error saving word: $e');
@@ -64,8 +70,13 @@ class DatabaseService {
     try {
       final db = await database;
       await db.delete('vocabulary_history', where: 'id = ?', whereArgs: [id]);
+      _historyStreamController.add(null);
     } catch (e) {
       debugPrint('Error deleting word: $e');
     }
+  }
+
+  void dispose() {
+    _historyStreamController.close();
   }
 }
