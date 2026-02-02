@@ -12,6 +12,8 @@ import '../services/subtitle_service.dart';
 import '../models/subtitle_entry.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../widgets/side_panel.dart';
+import '../services/dictionary_service.dart';
+import '../services/database_service.dart';
 
 class VideoPlayerScreen extends StatefulWidget {
   final AssetEntity videoFile;
@@ -94,6 +96,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
     // Load subtitles
     await _loadSubtitles();
+
+    // Initialize dictionary
+    await DictionaryService().initialize();
 
     setState(() => _isLoading = false);
     _startHideTimer();
@@ -620,23 +625,66 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _controller?.pause();
     setState(() => _selectedWord = word);
 
+    // Normalize word for consistency (Title Case)
+    final normalizedWord =
+        word[0].toUpperCase() + word.substring(1).toLowerCase();
+
+    // Lookup definition (Service handles its own normalization for lookup)
+    final definition = DictionaryService().lookup(word);
+
+    // Save to history if found (Fire and forget)
+    // Use normalizedWord so simple & capitalized versions map to same entry
+    if (definition != null) {
+      DatabaseService().upsertWord(normalizedWord, definition);
+    }
+
     // Show word definition in side panel
     SidePanel.show(
       context: context,
-      title: word,
+      title: normalizedWord,
       children: [
         Padding(
           padding: const EdgeInsets.all(16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.info_outline, color: Colors.white70, size: 48),
-              const SizedBox(height: 16),
-              const Text(
-                'Dictionary lookup will be implemented in Phase 4C',
-                style: TextStyle(color: Colors.white70, fontSize: 15),
-              ),
-              const SizedBox(height: 24),
+              if (definition != null) ...[
+                // Definition
+                Text(
+                  definition,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    height: 1.4,
+                  ),
+                ),
+              ] else
+                Column(
+                  children: [
+                    const Icon(
+                      Icons.search_off,
+                      color: Colors.white54,
+                      size: 48,
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Definition not found',
+                      style: TextStyle(color: Colors.white70, fontSize: 16),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Could not find a definition for "$word" in the local dictionary.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.5),
+                        fontSize: 14,
+                      ),
+                    ),
+                  ],
+                ),
+
+              const SizedBox(height: 32),
+
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(

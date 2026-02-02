@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'home_screen.dart';
+import 'vocabulary_history_screen.dart';
 
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
@@ -13,9 +14,7 @@ class _MainScreenState extends State<MainScreen> {
 
   final List<Widget> _screens = [
     const HomeScreen(), // Video Tab
-    const Center(
-      child: Text('Music', style: TextStyle(color: Colors.white)),
-    ),
+    const VocabularyHistoryScreen(), // History Tab (formerly Music)
     const Center(
       child: Text('Game', style: TextStyle(color: Colors.white)),
     ),
@@ -42,8 +41,8 @@ class _MainScreenState extends State<MainScreen> {
               label: 'VIDEO',
             ),
             BottomNavigationBarItem(
-              icon: Icon(Icons.music_note),
-              label: 'MUSIC',
+              icon: Icon(Icons.history), // Changed icon
+              label: 'HISTORY', // Changed label
             ),
             BottomNavigationBarItem(
               icon: Icon(Icons.videogame_asset),
