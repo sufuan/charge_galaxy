@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui; // Import dart:ui
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -61,6 +62,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   bool _isLearningMode = false;
   String? _selectedWord;
   Duration _lastSubtitleSearchPosition = Duration.zero;
+
+  // Horizontal Gesture Seeking
+  bool _isSeeking = false;
+  double _dragOffset = 0.0;
+  Duration? _seekStartPosition;
+  Duration? _seekTargetPosition;
+  String _seekPreviewText = '';
 
   @override
   void initState() {
@@ -324,6 +332,113 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       _initialVolume = newVolume;
       setState(() => _currentVolume = newVolume);
     }
+  }
+
+  void _handleHorizontalDragStart(DragStartDetails details) {
+    // Conflict resolution: Disable swipe seek in Learning Mode
+    if (_controller == null || _isLocked || _isLearningMode) return;
+
+    setState(() {
+      _isSeeking = true;
+      _dragOffset = 0.0;
+      _seekStartPosition = _controller!.value.position;
+      _seekTargetPosition = _seekStartPosition;
+      _seekPreviewText = '00:00';
+      _showControls = false; // Hide controls while seeking
+    });
+  }
+
+  void _handleHorizontalDragUpdate(DragUpdateDetails details) {
+    if (!_isSeeking || _controller == null || _seekStartPosition == null)
+      return;
+
+    // Conflict Fix: only precise horizontal movements
+    if (details.primaryDelta == null) return;
+    if (details.delta.dx.abs() < details.delta.dy.abs()) return;
+
+    // Accumulate drag offset
+    _dragOffset += details.primaryDelta!;
+
+    // Sensitivity: 0.2 seconds per pixel
+    final sensitivity = 0.2;
+    final addedSeconds = _dragOffset * sensitivity;
+
+    final startSeconds = _seekStartPosition!.inSeconds.toDouble();
+    final newTargetSeconds = (startSeconds + addedSeconds).clamp(
+      0.0,
+      _controller!.value.duration.inSeconds.toDouble(),
+    );
+
+    final newTargetPosition = Duration(seconds: newTargetSeconds.toInt());
+    final totalDuration = _controller!.value.duration;
+
+    // Formatting
+    final diff = newTargetPosition - _seekStartPosition!;
+    final sign = diff.isNegative ? '-' : '+';
+    final diffString = '$sign${_formatDuration(diff.abs())}';
+    final currentString = _formatDuration(newTargetPosition);
+    final totalString = _formatDuration(totalDuration);
+
+    setState(() {
+      _seekTargetPosition = newTargetPosition;
+      _seekPreviewText = '$diffString\n$currentString / $totalString';
+    });
+  }
+
+  void _handleHorizontalDragEnd(DragEndDetails details) {
+    if (!_isSeeking || _controller == null || _seekTargetPosition == null)
+      return;
+
+    _controller!.seekTo(_seekTargetPosition!);
+
+    setState(() {
+      _isSeeking = false;
+      _dragOffset = 0.0;
+      _seekStartPosition = null;
+      _seekTargetPosition = null;
+    });
+  }
+
+  Widget _buildSeekOverlay() {
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.black26, // Semi-transparent subtle background
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 5, sigmaY: 5), // Blur effect
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                (_seekTargetPosition?.compareTo(
+                              _seekStartPosition ?? Duration.zero,
+                            ) ??
+                            0) >=
+                        0
+                    ? Icons.fast_forward
+                    : Icons.fast_rewind,
+                color: Colors.white,
+                size: 28, // Smaller icon
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _seekPreviewText,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14, // Smaller text
+                  fontWeight: FontWeight.bold,
+                  height: 1.2,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _handleVerticalDragEnd(DragEndDetails details) {
@@ -781,16 +896,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           : _controller != null && _controller!.value.isInitialized
           ? GestureDetector(
               onTap: _toggleControls,
-              onDoubleTapDown: _handleDoubleTap,
-              onLongPressStart: _handleLongPressStart,
-              onLongPressEnd: _handleLongPressEnd,
-              onVerticalDragStart: _handleVerticalDragStart,
-              onVerticalDragUpdate: _handleVerticalDragUpdate,
-              onVerticalDragEnd: _handleVerticalDragEnd,
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  // Video
+                  // Video Layer
                   Center(
                     child: AspectRatio(
                       aspectRatio: _controller!.value.aspectRatio,
@@ -798,19 +907,34 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                     ),
                   ),
 
-                  // Seek feedback overlay
+                  // Middle Gesture Zone (60%)
+                  Positioned(
+                    top: MediaQuery.of(context).size.height * 0.2,
+                    height: MediaQuery.of(context).size.height * 0.6,
+                    left: 0,
+                    right: 0,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.translucent,
+                      onDoubleTapDown: _handleDoubleTap,
+                      onLongPressStart: _handleLongPressStart,
+                      onLongPressEnd: _handleLongPressEnd,
+                      onVerticalDragStart: _handleVerticalDragStart,
+                      onVerticalDragUpdate: _handleVerticalDragUpdate,
+                      onVerticalDragEnd: _handleVerticalDragEnd,
+                      onHorizontalDragStart: _handleHorizontalDragStart,
+                      onHorizontalDragUpdate: _handleHorizontalDragUpdate,
+                      onHorizontalDragEnd: _handleHorizontalDragEnd,
+                    ),
+                  ),
+
+                  // Visual Overlays
                   if (_seekFeedback != null) _buildSeekFeedback(),
-
-                  // 2x speed indicator
+                  if (_isSeeking) _buildSeekOverlay(),
                   if (_isLongPressing) _build2xSpeedIndicator(),
-
-                  // Brightness overlay
                   if (_showBrightnessOverlay) _buildBrightnessOverlay(),
-
-                  // Volume overlay
                   if (_showVolumeOverlay) _buildVolumeOverlay(),
 
-                  // Subtitle overlay
+                  // Subtitles
                   if (_subtitlesEnabled && _currentSubtitle != null)
                     SubtitleOverlay(
                       currentSubtitle: _currentSubtitle,
@@ -821,7 +945,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                       onLongPress: _onSentenceLongPress,
                     ),
 
-                  // Controls overlay
+                  // Controls Overlay
                   if (_showControls || _isLocked) _buildControls(),
                 ],
               ),
