@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:typed_data';
 import '../models/subtitle_entry.dart';
 
 class SubtitleService {
@@ -104,5 +105,41 @@ class SubtitleService {
       seconds: int.parse(seconds),
       milliseconds: int.parse(milliseconds),
     );
+  }
+
+  /// Compute OpenSubtitles MovieHash
+  /// Algorithm: 64-bit sum of file size + first 64KB + last 64KB
+  static Future<String> computeMovieHash(File file) async {
+    final int fileSize = await file.length();
+    int hash = fileSize;
+
+    final raf = await file.open(mode: FileMode.read);
+    try {
+      // Read first 64KB
+      final first64k = await raf.read(64 * 1024);
+      final firstData = first64k.buffer.asByteData();
+      for (int i = 0; i < first64k.length; i += 8) {
+        if (i + 8 <= first64k.length) {
+          hash += firstData.getUint64(i, Endian.little);
+          hash &= 0xFFFFFFFFFFFFFFFF; // Keep it 64-bit
+        }
+      }
+
+      // Read last 64KB
+      final startLast64k = fileSize - 64 * 1024;
+      await raf.setPosition(startLast64k > 0 ? startLast64k : 0);
+      final last64k = await raf.read(64 * 1024);
+      final lastData = last64k.buffer.asByteData();
+      for (int i = 0; i < last64k.length; i += 8) {
+        if (i + 8 <= last64k.length) {
+          hash += lastData.getUint64(i, Endian.little);
+          hash &= 0xFFFFFFFFFFFFFFFF; // Keep it 64-bit
+        }
+      }
+    } finally {
+      await raf.close();
+    }
+
+    return hash.toRadixString(16).padLeft(16, '0');
   }
 }

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:photo_manager/photo_manager.dart';
+import 'package:path/path.dart' as p;
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:file_picker/file_picker.dart';
@@ -15,6 +16,7 @@ import '../widgets/subtitle_overlay.dart';
 import '../widgets/side_panel.dart';
 import '../services/dictionary_service.dart';
 import '../services/database_service.dart';
+import '../services/subtitle_download_service.dart';
 
 class VideoPlayerScreen extends StatefulWidget {
   final AssetEntity? videoFile;
@@ -43,6 +45,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   Timer? _hideTimer;
 
   final HistoryService _historyService = HistoryService();
+  final SubtitleDownloadService _subtitleDownloadService =
+      SubtitleDownloadService();
 
   // Gesture tracking
   double? _initialBrightness;
@@ -362,8 +366,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _handleHorizontalDragStart(DragStartDetails details) {
-    // Conflict resolution: Disable swipe seek in Learning Mode
-    if (_controller == null || _isLocked || _isLearningMode) return;
+    // Conflict resolution: Only disable if locked
+    if (_controller == null || _isLocked) return;
 
     setState(() {
       _isSeeking = true;
@@ -602,76 +606,80 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
   Future<void> _handleCCButton() async {
     debugPrint('======= CC Button tapped =======');
-    debugPrint(
-      '_subtitles: ${_subtitles != null}, length: ${_subtitles?.length}',
-    );
 
-    if (_subtitles == null) {
-      // Load subtitle file
-      debugPrint('Opening file picker...');
-      await _loadSubtitleFile();
-    } else {
-      // Show subtitle settings in side panel
-      SidePanel.show(
-        context: context,
-        title: 'Subtitle',
-        children: [
-          // Current subtitle file
-          if (_subtitleFileName != null)
-            Container(
-              padding: const EdgeInsets.all(16),
-              margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.05),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.subtitles, color: Colors.white70, size: 20),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      _subtitleFileName!,
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 13,
-                      ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(
-                      Icons.close,
-                      color: Colors.white54,
-                      size: 18,
-                    ),
-                    onPressed: () {
-                      setState(() {
-                        _subtitles = null;
-                        _subtitleFileName = null;
-                        _subtitlesEnabled = false;
-                      });
-                      Navigator.pop(context);
-                    },
-                  ),
-                ],
-              ),
+    // Always show subtitle settings in side panel first
+    SidePanel.show(
+      context: context,
+      title: 'Subtitle',
+      children: [
+        // Current subtitle file info (only if loaded)
+        if (_subtitles != null && _subtitleFileName != null)
+          Container(
+            padding: const EdgeInsets.all(16),
+            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(8),
             ),
-
-          // Select files button
-          ListTile(
-            leading: const Icon(Icons.folder_open, color: Colors.white),
-            title: const Text(
-              'Select files',
-              style: TextStyle(color: Colors.white, fontSize: 15),
+            child: Row(
+              children: [
+                const Icon(Icons.subtitles, color: Colors.white70, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    _subtitleFileName!,
+                    style: const TextStyle(color: Colors.white70, fontSize: 13),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(
+                    Icons.close,
+                    color: Colors.white54,
+                    size: 18,
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _subtitles = null;
+                      _subtitleFileName = null;
+                      _subtitlesEnabled = false;
+                    });
+                    Navigator.pop(context);
+                  },
+                ),
+              ],
             ),
-            onTap: () {
-              Navigator.pop(context);
-              _loadSubtitleFile();
-            },
           ),
 
+        // Select subtitle button (Always visible)
+        ListTile(
+          leading: const Icon(Icons.folder_open, color: Colors.white),
+          title: const Text(
+            'Select subtitle',
+            style: TextStyle(color: Colors.white, fontSize: 15),
+          ),
+          onTap: () {
+            Navigator.pop(context);
+            _loadSubtitleFile();
+          },
+        ),
+
+        // Online subtitle button (Always visible)
+        ListTile(
+          leading: const Icon(Icons.public, color: Color(0xFF00C853)),
+          title: const Text(
+            'Online subtitle',
+            style: TextStyle(color: Colors.white, fontSize: 15),
+          ),
+          onTap: () {
+            Navigator.pop(context);
+            _showOnlineSubtitleSearch();
+          },
+        ),
+
+        // Only show customization if subtitles are loaded
+        if (_subtitles != null) ...[
           const Divider(color: Colors.white12, height: 1),
 
           // Customization section header
@@ -789,8 +797,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             },
           ),
         ],
-      );
-    }
+      ],
+    );
   }
 
   Future<void> _loadSubtitleFile() async {
@@ -823,6 +831,46 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       debugPrint('Subtitle file selection failed: $e');
       debugPrint('Stack trace: $stackTrace');
     }
+  }
+
+  void _showOnlineSubtitleSearch() {
+    final videoTitle =
+        widget.videoFile?.title ??
+        widget.videoPath?.split(Platform.pathSeparator).last.split('.').first ??
+        '';
+
+    SidePanel.show(
+      context: context,
+      title: 'Online Search',
+      children: [
+        OnlineSubtitleSearchContent(
+          initialQuery: videoTitle,
+          videoPath: widget.videoPath,
+          subtitleDownloadService: _subtitleDownloadService,
+          onSubtitleDownloaded: (path) async {
+            // Seamless player refresh
+            if (mounted) {
+              final subtitles = await SubtitleService.parseSRT(File(path));
+              setState(() {
+                _subtitles = subtitles;
+                _subtitlesEnabled = true;
+                _subtitleFileName = p.basename(path);
+                _currentSubtitleIndex = 0;
+                _currentSubtitle = null;
+              });
+
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Subtitles synchronized successfully!'),
+                  backgroundColor: Color(0xFF00C853),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            }
+          },
+        ),
+      ],
+    );
   }
 
   void _onWordTap(String word) {
@@ -1050,227 +1098,241 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     final duration = _controller?.value.duration ?? Duration.zero;
     final isPlaying = _controller?.value.isPlaying ?? false;
 
-    return Container(
-      color: const Color.fromARGB(128, 0, 0, 0),
-      child: SafeArea(
-        child: Stack(
-          children: [
-            // Top bar
-            if (!_isLocked)
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [Colors.black54, Colors.transparent],
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.arrow_back, color: Colors.white),
-                        onPressed: () => Navigator.pop(context),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          widget.videoFile?.title ??
-                              widget.videoPath
-                                  ?.split(Platform.pathSeparator)
-                                  .last ??
-                              'Video',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      IconButton(
-                        icon: Icon(
-                          _subtitlesEnabled
-                              ? Icons.closed_caption
-                              : Icons.closed_caption_outlined,
-                          color: _subtitlesEnabled
-                              ? const Color(0xFF00C853)
-                              : Colors.white,
-                        ),
-                        onPressed: _handleCCButton,
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.headphones, color: Colors.white),
-                        onPressed: () {},
-                      ),
-                      IconButton(
-                        icon: const Icon(
-                          Icons.playlist_play,
-                          color: Colors.white,
-                        ),
-                        onPressed: () {},
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.more_vert, color: Colors.white),
-                        onPressed: _showLearningModeMenu,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-            // Left controls
-            Positioned(
-              left: 12,
-              top: MediaQuery.of(context).size.height * 0.3,
-              child: Column(
-                children: [
-                  IconButton(
-                    icon: Icon(
-                      _isMuted ? Icons.volume_off : Icons.volume_up,
-                      color: Colors.white,
-                      size: 28,
-                    ),
-                    onPressed: _toggleMute,
-                  ),
-                  const SizedBox(height: 16),
-                  IconButton(
-                    icon: Icon(
-                      _isLocked ? Icons.lock : Icons.lock_open,
-                      color: Colors.white,
-                      size: 28,
-                    ),
-                    onPressed: _toggleLock,
-                  ),
-                ],
-              ),
-            ),
-
-            // Right controls
-            if (!_isLocked)
-              Positioned(
-                right: 12,
-                top: MediaQuery.of(context).size.height * 0.3,
-                child: IconButton(
-                  icon: const Icon(
-                    Icons.screen_rotation,
-                    color: Colors.white,
-                    size: 28,
-                  ),
-                  onPressed: _toggleOrientation,
-                ),
-              ),
-
-            // Bottom controls
-            if (!_isLocked)
-              Positioned(
-                bottom: 0,
-                left: 0,
-                right: 0,
-                child: Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [Colors.transparent, Colors.black54],
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      // Seek bar
-                      Row(
-                        children: [
-                          Text(
-                            _formatDuration(position),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                            ),
-                          ),
-                          Expanded(
-                            child: Slider(
-                              value: position.inMilliseconds.toDouble(),
-                              max: duration.inMilliseconds.toDouble(),
-                              activeColor: const Color(0xFF00C853),
-                              inactiveColor: Colors.white24,
-                              onChanged: (value) {
-                                _controller?.seekTo(
-                                  Duration(milliseconds: value.toInt()),
-                                );
-                              },
-                            ),
-                          ),
-                          Text(
-                            _formatDuration(duration),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                            ),
-                          ),
-                        ],
-                      ),
-                      // Controls
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          IconButton(
-                            icon: Icon(
-                              isPlaying
-                                  ? Icons.pause_circle_filled
-                                  : Icons.play_circle_filled,
-                              color: Colors.white,
-                              size: 40,
-                            ),
-                            onPressed: _togglePlayPause,
-                          ),
-                          IconButton(
-                            icon: const Icon(
-                              Icons.skip_previous,
-                              color: Colors.white54,
-                              size: 32,
-                            ),
-                            onPressed: null,
-                          ),
-                          IconButton(
-                            icon: const Icon(
-                              Icons.skip_next,
-                              color: Colors.white54,
-                              size: 32,
-                            ),
-                            onPressed: null,
-                          ),
-                          TextButton(
-                            onPressed: _showSpeedDialog,
-                            child: const Text(
-                              'Speed',
-                              style: TextStyle(color: Colors.white),
-                            ),
-                          ),
-                          IconButton(
-                            icon: const Icon(
-                              Icons.picture_in_picture_alt,
-                              color: Colors.white,
-                              size: 24,
-                            ),
-                            onPressed: () {},
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-          ],
+    return Stack(
+      children: [
+        // Background dim - now ignores pointers so it doesn't block the gesture zone below
+        IgnorePointer(
+          child: Container(color: const Color.fromARGB(128, 0, 0, 0)),
         ),
-      ),
+        SafeArea(
+          child: Stack(
+            children: [
+              // Top bar
+              if (!_isLocked)
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.black54, Colors.transparent],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        IconButton(
+                          icon: const Icon(
+                            Icons.arrow_back,
+                            color: Colors.white,
+                          ),
+                          onPressed: () => Navigator.pop(context),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            widget.videoFile?.title ??
+                                widget.videoPath
+                                    ?.split(Platform.pathSeparator)
+                                    .last ??
+                                'Video',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            _subtitlesEnabled
+                                ? Icons.closed_caption
+                                : Icons.closed_caption_outlined,
+                            color: _subtitlesEnabled
+                                ? const Color(0xFF00C853)
+                                : Colors.white,
+                          ),
+                          onPressed: _handleCCButton,
+                        ),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.headphones,
+                            color: Colors.white,
+                          ),
+                          onPressed: () {},
+                        ),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.playlist_play,
+                            color: Colors.white,
+                          ),
+                          onPressed: () {},
+                        ),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.more_vert,
+                            color: Colors.white,
+                          ),
+                          onPressed: _showLearningModeMenu,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+              // Left controls
+              Positioned(
+                left: 12,
+                top: MediaQuery.of(context).size.height * 0.3,
+                child: Column(
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        _isMuted ? Icons.volume_off : Icons.volume_up,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                      onPressed: _toggleMute,
+                    ),
+                    const SizedBox(height: 16),
+                    IconButton(
+                      icon: Icon(
+                        _isLocked ? Icons.lock : Icons.lock_open,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                      onPressed: _toggleLock,
+                    ),
+                  ],
+                ),
+              ),
+
+              // Right controls
+              if (!_isLocked)
+                Positioned(
+                  right: 12,
+                  top: MediaQuery.of(context).size.height * 0.3,
+                  child: IconButton(
+                    icon: const Icon(
+                      Icons.screen_rotation,
+                      color: Colors.white,
+                      size: 28,
+                    ),
+                    onPressed: _toggleOrientation,
+                  ),
+                ),
+
+              // Bottom controls
+              if (!_isLocked)
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.transparent, Colors.black54],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        // Seek bar
+                        Row(
+                          children: [
+                            Text(
+                              _formatDuration(position),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
+                            ),
+                            Expanded(
+                              child: Slider(
+                                value: position.inMilliseconds.toDouble(),
+                                max: duration.inMilliseconds.toDouble(),
+                                activeColor: const Color(0xFF00C853),
+                                inactiveColor: Colors.white24,
+                                onChanged: (value) {
+                                  _controller?.seekTo(
+                                    Duration(milliseconds: value.toInt()),
+                                  );
+                                },
+                              ),
+                            ),
+                            Text(
+                              _formatDuration(duration),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                        // Controls
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            IconButton(
+                              icon: Icon(
+                                isPlaying
+                                    ? Icons.pause_circle_filled
+                                    : Icons.play_circle_filled,
+                                color: Colors.white,
+                                size: 40,
+                              ),
+                              onPressed: _togglePlayPause,
+                            ),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.skip_previous,
+                                color: Colors.white54,
+                                size: 32,
+                              ),
+                              onPressed: null,
+                            ),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.skip_next,
+                                color: Colors.white54,
+                                size: 32,
+                              ),
+                              onPressed: null,
+                            ),
+                            TextButton(
+                              onPressed: _showSpeedDialog,
+                              child: const Text(
+                                'Speed',
+                                style: TextStyle(color: Colors.white),
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.picture_in_picture_alt,
+                                color: Colors.white,
+                                size: 24,
+                              ),
+                              onPressed: () {},
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -1400,6 +1462,324 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class OnlineSubtitleSearchContent extends StatefulWidget {
+  final String initialQuery;
+  final String? videoPath;
+  final SubtitleDownloadService subtitleDownloadService;
+  final Function(String) onSubtitleDownloaded;
+
+  const OnlineSubtitleSearchContent({
+    super.key,
+    required this.initialQuery,
+    required this.videoPath,
+    required this.subtitleDownloadService,
+    required this.onSubtitleDownloaded,
+  });
+
+  @override
+  State<OnlineSubtitleSearchContent> createState() =>
+      _OnlineSubtitleSearchContentState();
+}
+
+class _OnlineSubtitleSearchContentState
+    extends State<OnlineSubtitleSearchContent> {
+  late TextEditingController _searchController;
+  List<Map<String, dynamic>>? _results;
+  bool _isSearching = false;
+  double? _downloadProgress;
+
+  String? _movieHash;
+  bool _isCalculatingHash = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController = TextEditingController(text: widget.initialQuery);
+    // Trigger auto-search after build
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initSearch();
+    });
+  }
+
+  Future<void> _initSearch() async {
+    // 1. Calculate Hash first
+    if (widget.videoPath != null) {
+      setState(() => _isCalculatingHash = true);
+      try {
+        final hash = await SubtitleService.computeMovieHash(
+          File(widget.videoPath!),
+        );
+        if (mounted) {
+          setState(() {
+            _movieHash = hash;
+            _isCalculatingHash = false;
+          });
+          print('Computed MovieHash: $hash');
+        }
+      } catch (e) {
+        print('Error computing hash: $e');
+        if (mounted) setState(() => _isCalculatingHash = false);
+      }
+    }
+
+    // 2. Perform search
+    if (_searchController.text.isNotEmpty || _movieHash != null) {
+      _performSearch();
+    }
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _performSearch() async {
+    final query = _searchController.text.trim();
+    if (query.isEmpty && _movieHash == null) return;
+
+    setState(() {
+      _isSearching = true;
+      _results = null; // Clear previous results
+    });
+
+    debugPrint('Performing search for: $query (Hash: $_movieHash)');
+    final items = await widget.subtitleDownloadService.searchSubtitles(
+      query,
+      movieHash: _movieHash,
+    );
+
+    if (mounted) {
+      setState(() {
+        _isSearching = false;
+        _results = items ?? [];
+      });
+      debugPrint('Search completed. Results: ${_results?.length}');
+    }
+  }
+
+  Future<void> _handleDownload(Map<String, dynamic> item) async {
+    setState(() => _downloadProgress = -1);
+
+    try {
+      String? targetPath;
+      if (widget.videoPath != null) {
+        final dir = File(widget.videoPath!).parent.path;
+        final baseName = p.basenameWithoutExtension(widget.videoPath!);
+        targetPath = p.join(dir, '$baseName.srt');
+      }
+
+      if (targetPath == null) throw Exception('Target path not found');
+
+      debugPrint('Downloading subtitle ${item['id']} to $targetPath');
+      final success = await widget.subtitleDownloadService.downloadSubtitle(
+        int.parse(item['id'].toString()),
+        targetPath,
+      );
+
+      if (mounted) {
+        if (success) {
+          Navigator.pop(context); // Close panel
+          widget.onSubtitleDownloaded(targetPath);
+        } else {
+          setState(() => _downloadProgress = null);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Download failed'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Download error: $e');
+      if (mounted) {
+        setState(() => _downloadProgress = null);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Download error: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _searchController,
+            style: const TextStyle(color: Colors.white),
+            decoration: InputDecoration(
+              hintText: 'Search subtitles...',
+              hintStyle: TextStyle(color: Colors.white.withOpacity(0.3)),
+              filled: true,
+              fillColor: Colors.white.withOpacity(0.05),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide.none,
+              ),
+              suffixIcon: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_searchController.text.isNotEmpty)
+                    IconButton(
+                      icon: const Icon(
+                        Icons.clear,
+                        size: 18,
+                        color: Colors.white54,
+                      ),
+                      onPressed: () {
+                        _searchController.clear();
+                        setState(() {});
+                      },
+                    ),
+                  IconButton(
+                    icon: const Icon(Icons.search, color: Color(0xFF00C853)),
+                    onPressed: _isSearching ? null : _performSearch,
+                  ),
+                ],
+              ),
+            ),
+            onSubmitted: (_) => _performSearch(),
+          ),
+
+          if (_isCalculatingHash) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white54,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Computing file signature...',
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.5),
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ],
+
+          const SizedBox(height: 16),
+          if (_downloadProgress != null) ...[
+            const Text(
+              'Downloading...',
+              style: TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(
+              value: _downloadProgress == -1 ? null : _downloadProgress,
+              backgroundColor: Colors.white10,
+              valueColor: const AlwaysStoppedAnimation<Color>(
+                Color(0xFF00C853),
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+          if (_isSearching)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.all(20.0),
+                child: CircularProgressIndicator(color: Color(0xFF00C853)),
+              ),
+            )
+          else if (_results != null && _results!.isEmpty)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(20.0),
+                child: Column(
+                  children: [
+                    const Icon(
+                      Icons.search_off,
+                      color: Colors.white38,
+                      size: 40,
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'No results found',
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Try a different movie name or broad search.',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.3),
+                        fontSize: 12,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else if (_results == null &&
+              !_isSearching &&
+              (_searchController.text.isNotEmpty || _movieHash != null))
+            Center(
+              child: Column(
+                children: [
+                  const Icon(
+                    Icons.error_outline,
+                    color: Colors.redAccent,
+                    size: 32,
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Search failed. Try again.',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                  TextButton(
+                    onPressed: _performSearch,
+                    child: const Text(
+                      'RETRY',
+                      style: TextStyle(color: Color(0xFF00C853)),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else if (_results != null)
+            ..._results!.map(
+              (item) => Card(
+                color: Colors.white.withOpacity(0.05),
+                margin: const EdgeInsets.only(bottom: 8),
+                child: ListTile(
+                  title: Text(
+                    item['filename'],
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Text(
+                    'Language: ${item['language']} • Downloads: ${item['download_count']}',
+                    style: const TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.download, color: Color(0xFF00C853)),
+                    onPressed: () => _handleDownload(item),
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
