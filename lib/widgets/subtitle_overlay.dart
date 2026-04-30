@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
-import '../models/subtitle_entry.dart';
 
 class SubtitleOverlay extends StatelessWidget {
-  final SubtitleEntry? currentSubtitle;
+  final String? displayText;
   final double fontSize;
   final bool isLearningMode;
   final String? selectedWord;
@@ -13,7 +12,7 @@ class SubtitleOverlay extends StatelessWidget {
 
   const SubtitleOverlay({
     super.key,
-    this.currentSubtitle,
+    this.displayText,
     this.fontSize = 18.0,
     this.isLearningMode = false,
     this.selectedWord,
@@ -35,39 +34,45 @@ class SubtitleOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (currentSubtitle == null) {
+    if (displayText != null && displayText!.isNotEmpty) {
+      print("DEBUG_OVERLAY_BUILD: '$displayText'");
+    }
+
+    if (displayText == null || displayText!.trim().isEmpty) {
       return const SizedBox.shrink();
     }
 
     return Positioned(
       left: 0,
       right: 0,
-      bottom: 80, // Above controls
-      child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-          margin: const EdgeInsets.symmetric(horizontal: 32),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              Flexible(
-                child: isLearningMode
-                    ? _buildInteractiveSubtitle()
-                    : _buildStandardSubtitle(),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-                icon: Icon(
-                  isSaved ? Icons.bookmark : Icons.bookmark_border,
-                  color: isSaved ? const Color(0xFF00C853) : Colors.white70,
-                  size: 24,
+      bottom: 80, // Sits above controls but below middle zone interaction
+      child: SafeArea(
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            margin: const EdgeInsets.symmetric(horizontal: 32),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Flexible(
+                  child: isLearningMode
+                      ? _buildInteractiveSubtitle()
+                      : _buildStandardSubtitle(),
                 ),
-                onPressed: () => onSaveSentence?.call(currentSubtitle!.text),
-              ),
-            ],
+                const SizedBox(width: 8),
+                IconButton(
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  icon: Icon(
+                    isSaved ? Icons.bookmark : Icons.bookmark_border,
+                    color: isSaved ? const Color(0xFF00C853) : Colors.white70,
+                    size: 24,
+                  ),
+                  onPressed: () => onSaveSentence?.call(displayText!),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -75,7 +80,7 @@ class SubtitleOverlay extends StatelessWidget {
   }
 
   Widget _buildInteractiveSubtitle() {
-    final words = _tokenizeSubtitle(currentSubtitle!.text);
+    final words = _tokenizeSubtitle(displayText!);
 
     return Wrap(
       alignment: WrapAlignment.center,
@@ -136,7 +141,7 @@ class SubtitleOverlay extends StatelessWidget {
 
   Widget _buildStandardSubtitle() {
     return Text(
-      currentSubtitle!.text,
+      displayText!,
       textAlign: TextAlign.center,
       style: TextStyle(
         color: Colors.white,

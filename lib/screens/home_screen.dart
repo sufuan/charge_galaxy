@@ -16,6 +16,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   List<AssetEntity> _videos = [];
   List<AssetEntity> _historyVideos = [];
+  // Watched fraction (0.0–1.0) per video id, updated alongside _historyVideos.
+  Map<String, double> _historyProgress = {};
   List<AssetPathEntity> _folders = [];
   bool _isLoading = true;
   final HistoryService _historyService = HistoryService();
@@ -23,9 +25,22 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    // React to history writes from anywhere in the app so the History
+    // strip refreshes in real-time (no n-1 lag from Navigator.pop).
+    _historyService.addListener(_onHistoryChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _fetchVideos();
     });
+  }
+
+  @override
+  void dispose() {
+    _historyService.removeListener(_onHistoryChanged);
+    super.dispose();
+  }
+
+  void _onHistoryChanged() {
+    _loadHistory();
   }
 
   Future<void> _fetchVideos() async {
@@ -54,42 +69,62 @@ class _HomeScreenState extends State<HomeScreen> {
       // Fetch Recent videos (index 0)
       final videos = await albums[0].getAssetListRange(start: 0, end: 1000);
 
-      // Load History
-      await _loadHistory(videos);
-
       setState(() {
         _videos = videos;
         _isLoading = false;
       });
+
+      // Load History after _videos is populated so the resolver can use it.
+      await _loadHistory();
     } catch (e) {
       debugPrint('Error: $e');
       setState(() => _isLoading = false);
     }
   }
 
-  Future<void> _loadHistory(List<AssetEntity> availableVideos) async {
+  Future<void> _loadHistory() async {
     final historyIds = await _historyService.getHistoryIds();
     final historyVideos = <AssetEntity>[];
+    final historyProgress = <String, double>{};
 
     for (final id in historyIds) {
-      try {
-        final video = availableVideos.firstWhere((v) => v.id == id);
-        historyVideos.add(video);
-      } catch (e) {
-        // Video missing
+      // Fast path: resolve from the cached video list.
+      AssetEntity? video;
+      for (final v in _videos) {
+        if (v.id == id) {
+          video = v;
+          break;
+        }
       }
+      // Fallback: fetch by id directly so freshly played videos that
+      // aren't in the cached list still appear in History immediately.
+      video ??= await AssetEntity.fromId(id);
+      if (video == null) continue;
+
+      historyVideos.add(video);
+
+      // Compute watched fraction = watched_seconds / total_seconds.
+      final watched = await _historyService.getProgress(id);
+      final total = video.duration;
+      historyProgress[id] = total > 0 ? (watched / total).clamp(0.0, 1.0) : 0.0;
     }
-    setState(() => _historyVideos = historyVideos);
+
+    if (!mounted) return;
+    setState(() {
+      _historyVideos = historyVideos;
+      _historyProgress = historyProgress;
+    });
   }
 
   void _navigateToPlayer(AssetEntity video) async {
+    // No need to manually reload after pop — the HistoryService listener
+    // will refresh the strip the moment progress is saved.
     await Navigator.push(
       context,
       MaterialPageRoute(
         builder: (context) => VideoPlayerScreen(videoFile: video),
       ),
     );
-    _loadHistory(_videos);
   }
 
   @override
@@ -171,10 +206,11 @@ class _HomeScreenState extends State<HomeScreen> {
                           itemCount: _historyVideos.length,
                           separatorBuilder: (_, __) => const SizedBox(width: 0),
                           itemBuilder: (context, index) {
+                            final video = _historyVideos[index];
                             return HistoryItem(
-                              video: _historyVideos[index],
-                              onTap: () =>
-                                  _navigateToPlayer(_historyVideos[index]),
+                              video: video,
+                              progress: _historyProgress[video.id] ?? 0.0,
+                              onTap: () => _navigateToPlayer(video),
                             );
                           },
                         ),

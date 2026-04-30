@@ -5,8 +5,15 @@ import 'package:photo_manager/photo_manager.dart';
 class HistoryItem extends StatelessWidget {
   final AssetEntity video;
   final VoidCallback? onTap;
+  // Watched fraction in the range [0.0, 1.0].
+  final double progress;
 
-  const HistoryItem({super.key, required this.video, this.onTap});
+  const HistoryItem({
+    super.key,
+    required this.video,
+    this.onTap,
+    this.progress = 0.0,
+  });
 
   String _formatDuration(int seconds) {
     final duration = Duration(seconds: seconds);
@@ -67,7 +74,7 @@ class HistoryItem extends StatelessWidget {
                     ),
                   ),
                 ),
-                // Progress Bar (Mock)
+                // Progress Bar — driven by saved watch position.
                 Positioned(
                   bottom: 0,
                   left: 0,
@@ -77,8 +84,8 @@ class HistoryItem extends StatelessWidget {
                       bottom: Radius.circular(8),
                     ),
                     child: LinearProgressIndicator(
-                      value: 0.4, // Mock value
-                      backgroundColor: Colors.transparent,
+                      value: progress.clamp(0.0, 1.0),
+                      backgroundColor: Colors.white24,
                       valueColor: const AlwaysStoppedAnimation<Color>(
                         Color(0xFF00C853),
                       ),

@@ -34,11 +34,13 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  video_player: ^2.8.0
-  chewie: ^1.7.0
+  media_kit: ^1.1.10
+  media_kit_video: ^1.2.4
+  media_kit_libs_windows_video: any
+  media_kit_libs_android_video: ^1.2.0
   photo_manager: ^3.0.0
-  screen_brightness: ^1.0.1
-  volume_controller: ^2.0.7
+  screen_brightness: any
+  volume_controller: any
   shared_preferences: ^2.2.2
   http: ^1.2.0
   google_fonts: ^8.0.0

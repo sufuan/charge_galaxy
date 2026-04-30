@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:media_kit/media_kit.dart'; // Import MediaKit
 
 import 'screens/main_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  MediaKit.ensureInitialized(); // Initialize MediaKit
   runApp(const ChargedGalaxyApp());
 }
 

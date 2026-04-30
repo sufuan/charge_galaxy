@@ -3,7 +3,9 @@ import 'dart:io';
 import 'dart:ui' as ui; // Import dart:ui
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:video_player/video_player.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:volume_controller/volume_controller.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:path/path.dart' as p;
 import 'package:screen_brightness/screen_brightness.dart';
@@ -35,7 +37,14 @@ class VideoPlayerScreen extends StatefulWidget {
 }
 
 class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
-  VideoPlayerController? _controller;
+  late final Player _player;
+  late final VideoController _controller;
+
+  // Stream Subscriptions
+  StreamSubscription<Duration>? _positionSubscription;
+  StreamSubscription<Duration>? _durationSubscription;
+  StreamSubscription<bool>? _playingSubscription;
+  StreamSubscription<List<String>>? _subtitleSubscription;
   bool _isLoading = true;
   bool _showControls = true;
   bool _isLocked = false;
@@ -82,6 +91,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   Duration? _seekTargetPosition;
   String _seekPreviewText = '';
 
+  String? _resolvedVideoPath;
+
+  // Unified Subtitle State
+  bool _useInternalSubtitles = true;
+  String? _liveInternalCaption;
+  String? _lastCapturedInternalCaption;
+
+  // Resume playback state
+  bool _initialSeekComplete = false;
+  // Throttle progress writes triggered by the position stream.
+  DateTime _lastProgressSaveAt = DateTime.fromMillisecondsSinceEpoch(0);
+  static const Duration _progressSaveInterval = Duration(seconds: 5);
+
   @override
   void initState() {
     super.initState();
@@ -107,82 +129,180 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       return;
     }
 
-    _controller = VideoPlayerController.file(file);
-    await _controller!.initialize();
+    // Initialize MediaKit
+    _player = Player();
+    _controller = VideoController(_player);
 
-    final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
-
-    // Restore progress or jump to saved position
-    int startingPosition;
-    if (widget.initialPositionMs != null) {
-      startingPosition = widget.initialPositionMs! ~/ 1000;
-      await _controller!.seekTo(
-        Duration(milliseconds: widget.initialPositionMs!),
-      );
-    } else {
-      startingPosition = await _historyService.getProgress(videoId);
-      if (startingPosition > 0 &&
-          startingPosition < _controller!.value.duration.inSeconds) {
-        await _controller!.seekTo(Duration(seconds: startingPosition));
+    // 1. Position Listener
+    _positionSubscription = _player.stream.position.listen((position) {
+      if (mounted) {
+        _updateSubtitle();
+        setState(() {});
       }
-    }
+      // Persist progress at most once per _progressSaveInterval so the
+      // History strip reflects up-to-date watch percentage even if dispose
+      // doesn't fire (e.g. app killed or backgrounded).
+      if (_initialSeekComplete) {
+        final now = DateTime.now();
+        if (now.difference(_lastProgressSaveAt) >= _progressSaveInterval) {
+          _lastProgressSaveAt = now;
+          _saveProgress();
+        }
+      }
+    });
 
-    _controller!.play();
-    _controller!.addListener(_videoListener);
-    _controller!.setVolume(_playerVolume);
+    // 2. Duration Listener
+    _durationSubscription = _player.stream.duration.listen((duration) {
+      if (mounted) setState(() {});
+    });
 
-    // Save to history immediately when video starts
-    await _historyService.saveProgress(videoId, startingPosition);
+    // 3. Playing State Listener
+    _playingSubscription = _player.stream.playing.listen((playing) {
+      if (mounted) setState(() {});
+    });
 
-    // Load subtitles
-    await _loadSubtitles();
+    // 4. Subtitle Stream Listener (Dictionary Bridge)
+    _subtitleSubscription = _player.stream.subtitle.listen((
+      List<String> tracks,
+    ) {
+      if (mounted && _useInternalSubtitles) {
+        if (tracks.isNotEmpty) {
+          final text = tracks.first;
+          if (_liveInternalCaption != text) {
+            setState(() => _liveInternalCaption = text);
+          }
+        } else {
+          if (_liveInternalCaption != null &&
+              _liveInternalCaption!.isNotEmpty) {
+            setState(() => _liveInternalCaption = "");
+          }
+        }
+      }
+    });
 
-    // Initialize dictionary
-    await DictionaryService().initialize();
+    // 5. Completion Logic
+    _player.stream.completed.listen((completed) {
+      if (completed) {
+        WakelockPlus.disable();
+        if (mounted) _toggleControls();
+      }
+    });
 
-    setState(() => _isLoading = false);
-    _startHideTimer();
-  }
+    try {
+      await _player.open(Media(file.path), play: false);
 
-  void _videoListener() {
-    if (mounted) {
-      _updateSubtitle();
-      setState(() {});
+      final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
+
+      // Restore volume (MediaKit uses 0-100)
+      double? savedVolume = await _historyService.getVolume(videoId);
+      if (savedVolume == null) {
+        try {
+          savedVolume = await VolumeController().getVolume();
+        } catch (e) {
+          savedVolume = 1.0;
+        }
+      }
+      _playerVolume = savedVolume;
+      await _player.setVolume(_playerVolume * 100);
+
+      // Restore position
+      int startPosition = 0;
+      if (widget.initialPositionMs != null) {
+        startPosition = widget.initialPositionMs!;
+      } else {
+        final saved = await _historyService.getProgress(videoId);
+        startPosition = saved * 1000;
+      }
+
+      if (startPosition > 0) {
+        // Wait until the player reports a valid duration before seeking,
+        // otherwise the seek is dropped and playback starts at 0.
+        try {
+          await _player.stream.duration
+              .firstWhere((d) => d > Duration.zero)
+              .timeout(const Duration(seconds: 5));
+        } catch (_) {
+          // Continue even if duration never arrived in time
+        }
+
+        // Clamp against known duration so we don't seek past the end
+        final knownDuration = _player.state.duration;
+        if (knownDuration > Duration.zero &&
+            startPosition >= knownDuration.inMilliseconds) {
+          startPosition = 0;
+        }
+
+        if (startPosition > 0) {
+          await _player.seek(Duration(milliseconds: startPosition));
+        }
+      }
+
+      _initialSeekComplete = true;
+
+      // Save initial state (also bumps this video to the top of History)
+      await _historyService.saveProgress(
+        videoId,
+        startPosition ~/ 1000,
+        volume: _playerVolume,
+      );
+
+      await _player.play();
+
+      // Load subtitles (External)
+      await _loadSubtitles();
+      // Initialize dictionary
+      await DictionaryService().initialize();
+
+      setState(() {
+        _resolvedVideoPath = file?.path;
+        _isLoading = false;
+        _currentVolume = _playerVolume;
+      });
+      _startHideTimer();
+    } catch (e) {
+      debugPrint('Error initializing player: $e');
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
 
   void _startHideTimer() {
     _hideTimer?.cancel();
-    _hideTimer = Timer(const Duration(seconds: 2), () {
-      if (mounted && !_isLocked) {
+    _hideTimer = Timer(const Duration(seconds: 10), () {
+      if (mounted) {
         setState(() => _showControls = false);
       }
     });
   }
 
   void _toggleControls() {
-    if (_isLocked) return;
-    setState(() => _showControls = !_showControls);
-    if (_showControls) _startHideTimer();
+    setState(() {
+      _showControls = !_showControls;
+      if (_showControls) {
+        _startHideTimer();
+      } else {
+        _hideTimer?.cancel();
+      }
+    });
   }
 
   void _togglePlayPause() {
-    if (_controller == null) return;
     setState(() {
-      if (_controller!.value.isPlaying) {
-        _controller!.pause();
+      _player.playOrPause();
+      if (!_player.state.playing) {
+        // Paused
       } else {
-        _controller!.play();
+        // Playing
         _startHideTimer();
       }
     });
   }
 
   void _toggleMute() {
-    if (_controller == null) return;
     setState(() {
       _isMuted = !_isMuted;
-      _controller!.setVolume(_isMuted ? 0.0 : _playerVolume);
+      _player.setVolume(_isMuted ? 0.0 : _playerVolume * 100);
     });
   }
 
@@ -221,7 +341,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             setState(() {
               _playbackSpeed = speed;
               _savedSpeed = speed;
-              _controller?.setPlaybackSpeed(speed);
+              _player.setRate(speed);
             });
             Navigator.pop(context);
           },
@@ -268,15 +388,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _handleDoubleTap(TapDownDetails details) {
-    if (_controller == null) return;
     final screenWidth = MediaQuery.of(context).size.width;
     final isRightSide = details.globalPosition.dx > screenWidth / 2;
 
-    final currentPosition = _controller!.value.position;
+    final currentPosition = _player.state.position;
     final seekDuration = isRightSide ? 10 : -10;
     final newPosition = currentPosition + Duration(seconds: seekDuration);
 
-    _controller!.seekTo(newPosition);
+    _player.seek(newPosition);
 
     // Show feedback
     setState(() {
@@ -293,21 +412,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _handleLongPressStart(LongPressStartDetails details) {
-    if (_controller == null || _isLongPressing) return;
+    if (_isLongPressing) return;
     setState(() {
       _isLongPressing = true;
       _savedSpeed = _playbackSpeed;
       _playbackSpeed = 2.0;
-      _controller?.setPlaybackSpeed(2.0);
+      _player.setRate(2.0);
     });
   }
 
   void _handleLongPressEnd(LongPressEndDetails details) {
-    if (_controller == null || !_isLongPressing) return;
+    if (!_isLongPressing) return;
     setState(() {
       _isLongPressing = false;
       _playbackSpeed = _savedSpeed;
-      _controller?.setPlaybackSpeed(_savedSpeed);
+      _player.setRate(_savedSpeed);
     });
   }
 
@@ -358,21 +477,26 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       final newVolume = (_initialVolume! + delta).clamp(0.0, 1.0);
       _playerVolume = newVolume;
       if (!_isMuted) {
-        _controller?.setVolume(newVolume);
+        _player.setVolume(newVolume * 100);
       }
       _initialVolume = newVolume;
       setState(() => _currentVolume = newVolume);
+
+      // Persist volume change immediately
+      final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
+      final position = _player.state.position.inSeconds;
+      _historyService.saveProgress(videoId, position, volume: newVolume);
     }
   }
 
   void _handleHorizontalDragStart(DragStartDetails details) {
     // Conflict resolution: Only disable if locked
-    if (_controller == null || _isLocked) return;
+    if (_isLocked) return;
 
     setState(() {
       _isSeeking = true;
       _dragOffset = 0.0;
-      _seekStartPosition = _controller!.value.position;
+      _seekStartPosition = _player.state.position;
       _seekTargetPosition = _seekStartPosition;
       _seekPreviewText = '00:00';
       _showControls = false; // Hide controls while seeking
@@ -380,8 +504,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _handleHorizontalDragUpdate(DragUpdateDetails details) {
-    if (!_isSeeking || _controller == null || _seekStartPosition == null)
-      return;
+    if (!_isSeeking || _seekStartPosition == null) return;
 
     // Conflict Fix: only precise horizontal movements
     if (details.primaryDelta == null) return;
@@ -397,11 +520,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     final startSeconds = _seekStartPosition!.inSeconds.toDouble();
     final newTargetSeconds = (startSeconds + addedSeconds).clamp(
       0.0,
-      _controller!.value.duration.inSeconds.toDouble(),
+      _player.state.duration.inSeconds.toDouble(),
     );
 
     final newTargetPosition = Duration(seconds: newTargetSeconds.toInt());
-    final totalDuration = _controller!.value.duration;
+    final totalDuration = _player.state.duration;
 
     // Formatting
     final diff = newTargetPosition - _seekStartPosition!;
@@ -417,10 +540,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _handleHorizontalDragEnd(DragEndDetails details) {
-    if (!_isSeeking || _controller == null || _seekTargetPosition == null)
-      return;
+    if (!_isSeeking || _seekTargetPosition == null) return;
 
-    _controller!.seekTo(_seekTargetPosition!);
+    _player.seek(_seekTargetPosition!);
 
     setState(() {
       _isSeeking = false;
@@ -519,11 +641,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _updateSubtitle() {
-    if (_subtitles == null || _subtitles!.isEmpty || _controller == null) {
+    if (_subtitles == null || _subtitles!.isEmpty) {
       return;
     }
 
-    final position = _controller!.value.position;
+    final position = _player.state.position;
 
     // Reset index if we jumped backwards
     if (position < _lastSubtitleSearchPosition) {
@@ -579,7 +701,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     }
 
     final videoPath = videoFile?.path;
-    final timestampMs = _controller?.value.position.inMilliseconds ?? 0;
+    final timestampMs = _player.state.position.inMilliseconds;
 
     await DatabaseService().saveSentence(
       sentence: sentence,
@@ -612,45 +734,125 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       context: context,
       title: 'Subtitle',
       children: [
-        // Current subtitle file info (only if loaded)
-        if (_subtitles != null && _subtitleFileName != null)
-          Container(
-            padding: const EdgeInsets.all(16),
-            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.05),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              children: [
-                const Icon(Icons.subtitles, color: Colors.white70, size: 20),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    _subtitleFileName!,
-                    style: const TextStyle(color: Colors.white70, fontSize: 13),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                IconButton(
-                  icon: const Icon(
-                    Icons.close,
-                    color: Colors.white54,
-                    size: 18,
-                  ),
-                  onPressed: () {
-                    setState(() {
-                      _subtitles = null;
-                      _subtitleFileName = null;
-                      _subtitlesEnabled = false;
-                    });
-                    Navigator.pop(context);
-                  },
-                ),
-              ],
+        // Toggle between Built-in and External
+        // Unified Subtitle List
+
+        // 1. Embedded Subtitles Options (Dynamic)
+        if (_player.state.tracks.subtitle.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Text(
+              "Embedded Tracks",
+              style: TextStyle(color: Colors.white54, fontSize: 12),
             ),
           ),
+          ..._player.state.tracks.subtitle.map((track) {
+            final isSelected =
+                _useInternalSubtitles && _player.state.track.subtitle == track;
+            return ListTile(
+              leading: Icon(
+                Icons.subtitles,
+                color: isSelected ? const Color(0xFF00C853) : Colors.white,
+              ),
+              title: Text(
+                track.title ?? track.language ?? 'Track ${track.id}',
+                style: TextStyle(
+                  color: isSelected ? const Color(0xFF00C853) : Colors.white,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+              trailing: isSelected
+                  ? const Icon(Icons.check, color: Color(0xFF00C853), size: 18)
+                  : null,
+              onTap: () {
+                setState(() {
+                  _useInternalSubtitles = true;
+                  _subtitles = null; // Clear external
+                  _subtitleFileName = null;
+                  _currentSubtitle = null;
+                  _subtitlesEnabled = true;
+
+                  // Set track
+                  _player.setSubtitleTrack(track);
+
+                  _liveInternalCaption = null; // Ghost fix
+                });
+                Navigator.pop(context);
+              },
+            );
+          }).toList(),
+          const Divider(color: Colors.white12, height: 1),
+        ],
+
+        // Option to disable internal subtitles if no track selected or specifically "None"
+        ListTile(
+          leading: const Icon(Icons.subtitles_off, color: Colors.white),
+          title: const Text(
+            "None (Internal)",
+            style: TextStyle(color: Colors.white),
+          ),
+          onTap: () {
+            _player.setSubtitleTrack(SubtitleTrack.no());
+            setState(() {
+              _liveInternalCaption = null;
+            });
+            Navigator.pop(context);
+          },
+        ),
+
+        // 2. External File Option (if loaded)
+        if (_subtitles != null && _subtitleFileName != null)
+          ListTile(
+            leading: Icon(
+              Icons.description,
+              color: !_useInternalSubtitles
+                  ? const Color(0xFF00C853)
+                  : Colors.white,
+            ),
+            title: Text(
+              _subtitleFileName!,
+              style: TextStyle(
+                color: !_useInternalSubtitles
+                    ? const Color(0xFF00C853)
+                    : Colors.white,
+                fontSize: 15,
+                fontWeight: !_useInternalSubtitles
+                    ? FontWeight.bold
+                    : FontWeight.normal,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: !_useInternalSubtitles
+                ? const Icon(Icons.check, color: Color(0xFF00C853), size: 18)
+                : IconButton(
+                    icon: const Icon(
+                      Icons.close,
+                      color: Colors.white54,
+                      size: 18,
+                    ),
+                    onPressed: () {
+                      setState(() {
+                        _subtitles = null;
+                        _subtitleFileName = null;
+                        _useInternalSubtitles = true; // Revert to internal
+                        _liveInternalCaption = null;
+                      });
+                      Navigator.pop(context);
+                    },
+                  ),
+            onTap: () {
+              setState(() {
+                _useInternalSubtitles = false;
+                _subtitlesEnabled = true;
+                _liveInternalCaption = null; // Ghost fix
+                _lastCapturedInternalCaption = null;
+              });
+              Navigator.pop(context);
+            },
+          ),
+
+        const Divider(color: Colors.white12, height: 1),
 
         // Select subtitle button (Always visible)
         ListTile(
@@ -660,11 +862,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             style: TextStyle(color: Colors.white, fontSize: 15),
           ),
           onTap: () {
+            setState(() {
+              _useInternalSubtitles =
+                  false; // Disable internal when loading external
+              _liveInternalCaption = null; // Ghost fix
+              _lastCapturedInternalCaption = null;
+            });
             Navigator.pop(context);
             _loadSubtitleFile();
           },
         ),
 
+        /*
         // Online subtitle button (Always visible)
         ListTile(
           leading: const Icon(Icons.public, color: Color(0xFF00C853)),
@@ -677,6 +886,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             _showOnlineSubtitleSearch();
           },
         ),
+        */
 
         // Only show customization if subtitles are loaded
         if (_subtitles != null) ...[
@@ -845,7 +1055,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       children: [
         OnlineSubtitleSearchContent(
           initialQuery: videoTitle,
-          videoPath: widget.videoPath,
+          videoPath: _resolvedVideoPath ?? widget.videoPath,
           subtitleDownloadService: _subtitleDownloadService,
           onSubtitleDownloaded: (path) async {
             // Seamless player refresh
@@ -875,7 +1085,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
   void _onWordTap(String word) {
     debugPrint('Word tapped: $word');
-    _controller?.pause();
+    _player.pause();
     setState(() => _selectedWord = word);
 
     // Normalize word for consistency (Title Case)
@@ -963,7 +1173,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   void _onModalClose() {
-    _controller?.play();
+    _player.play();
     setState(() => _selectedWord = null);
   }
 
@@ -989,18 +1199,33 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _seekFeedbackTimer?.cancel();
     _overlayTimer?.cancel();
     _saveProgress();
-    _controller?.removeListener(_videoListener);
-    _controller?.dispose();
+
+    _positionSubscription?.cancel();
+    _durationSubscription?.cancel();
+    _playingSubscription?.cancel();
+    _subtitleSubscription?.cancel();
+
+    _player.dispose();
+
     WakelockPlus.disable();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     super.dispose();
   }
 
   Future<void> _saveProgress() async {
-    if (_controller != null && _controller!.value.isInitialized) {
-      final position = _controller!.value.position.inSeconds;
+    // Don't overwrite a previously saved position with ~0 if we exited
+    // before the resume-seek had a chance to be applied.
+    if (!_initialSeekComplete) return;
+
+    final duration = _player.state.duration;
+    if (duration != Duration.zero) {
+      final position = _player.state.position.inSeconds;
       final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
-      await _historyService.saveProgress(videoId, position);
+      await _historyService.saveProgress(
+        videoId,
+        position,
+        volume: _playerVolume,
+      );
     }
   }
 
@@ -1025,17 +1250,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           ? const Center(
               child: CircularProgressIndicator(color: Color(0xFF00C853)),
             )
-          : _controller != null && _controller!.value.isInitialized
-          ? GestureDetector(
+          : GestureDetector(
               onTap: _toggleControls,
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  // Video Layer
+                  // Video Layer - disable built-in controls
                   Center(
-                    child: AspectRatio(
-                      aspectRatio: _controller!.value.aspectRatio,
-                      child: VideoPlayer(_controller!),
+                    child: Video(
+                      controller: _controller,
+                      controls: NoVideoControls,
+                      subtitleViewConfiguration: const SubtitleViewConfiguration(
+                        visible:
+                            false, // Hide native subtitles, use SubtitleOverlay instead
+                      ),
                     ),
                   ),
 
@@ -1047,6 +1275,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                     right: 0,
                     child: GestureDetector(
                       behavior: HitTestBehavior.translucent,
+                      onTap: _toggleControls,
                       onDoubleTapDown: _handleDoubleTap,
                       onLongPressStart: _handleLongPressStart,
                       onLongPressEnd: _handleLongPressEnd,
@@ -1067,9 +1296,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                   if (_showVolumeOverlay) _buildVolumeOverlay(),
 
                   // Subtitles
-                  if (_subtitlesEnabled && _currentSubtitle != null)
+                  if (_subtitlesEnabled)
                     SubtitleOverlay(
-                      currentSubtitle: _currentSubtitle,
+                      displayText: _useInternalSubtitles
+                          ? _liveInternalCaption
+                          : _currentSubtitle?.text,
                       fontSize: _subtitleTextSize,
                       isLearningMode: _isLearningMode,
                       selectedWord: _selectedWord,
@@ -1083,48 +1314,32 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                   if (_showControls || _isLocked) _buildControls(),
                 ],
               ),
-            )
-          : const Center(
-              child: Text(
-                'Error loading video',
-                style: TextStyle(color: Colors.white),
-              ),
             ),
     );
   }
 
   Widget _buildControls() {
-    final position = _controller?.value.position ?? Duration.zero;
-    final duration = _controller?.value.duration ?? Duration.zero;
-    final isPlaying = _controller?.value.isPlaying ?? false;
+    final position = _player.state.position;
+    final duration = _player.state.duration;
+    final isPlaying = _player.state.playing;
 
     return Stack(
       children: [
-        // Background dim - now ignores pointers so it doesn't block the gesture zone below
-        IgnorePointer(
-          child: Container(color: const Color.fromARGB(128, 0, 0, 0)),
-        ),
-        SafeArea(
-          child: Stack(
-            children: [
-              // Top bar
-              if (!_isLocked)
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: const BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [Colors.black54, Colors.transparent],
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                      ),
-                    ),
+        // Background dim
+        if (_showControls || _isLocked)
+          IgnorePointer(child: Container(color: Colors.black45)),
+
+        // Controls
+        if (_showControls)
+          SafeArea(
+            child: Stack(
+              children: [
+                // Top bar
+                if (!_isLocked)
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
                     child: Row(
                       children: [
                         IconButton(
@@ -1134,7 +1349,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                           ),
                           onPressed: () => Navigator.pop(context),
                         ),
-                        const SizedBox(width: 8),
                         Expanded(
                           child: Text(
                             widget.videoFile?.title ??
@@ -1163,20 +1377,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                         ),
                         IconButton(
                           icon: const Icon(
-                            Icons.headphones,
-                            color: Colors.white,
-                          ),
-                          onPressed: () {},
-                        ),
-                        IconButton(
-                          icon: const Icon(
-                            Icons.playlist_play,
-                            color: Colors.white,
-                          ),
-                          onPressed: () {},
-                        ),
-                        IconButton(
-                          icon: const Icon(
                             Icons.more_vert,
                             color: Colors.white,
                           ),
@@ -1185,153 +1385,113 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                       ],
                     ),
                   ),
-                ),
 
-              // Left controls
-              Positioned(
-                left: 12,
-                top: MediaQuery.of(context).size.height * 0.3,
-                child: Column(
-                  children: [
-                    IconButton(
+                // Center - Play/Pause
+                if (!_isLocked)
+                  Center(
+                    child: IconButton(
                       icon: Icon(
-                        _isMuted ? Icons.volume_off : Icons.volume_up,
+                        isPlaying ? Icons.pause : Icons.play_arrow,
                         color: Colors.white,
-                        size: 28,
+                        size: 48,
                       ),
-                      onPressed: _toggleMute,
+                      onPressed: _togglePlayPause,
                     ),
-                    const SizedBox(height: 16),
-                    IconButton(
-                      icon: Icon(
-                        _isLocked ? Icons.lock : Icons.lock_open,
-                        color: Colors.white,
-                        size: 28,
-                      ),
-                      onPressed: _toggleLock,
-                    ),
-                  ],
-                ),
-              ),
-
-              // Right controls
-              if (!_isLocked)
-                Positioned(
-                  right: 12,
-                  top: MediaQuery.of(context).size.height * 0.3,
-                  child: IconButton(
-                    icon: const Icon(
-                      Icons.screen_rotation,
-                      color: Colors.white,
-                      size: 28,
-                    ),
-                    onPressed: _toggleOrientation,
                   ),
-                ),
 
-              // Bottom controls
-              if (!_isLocked)
-                Positioned(
-                  bottom: 0,
-                  left: 0,
-                  right: 0,
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: const BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [Colors.transparent, Colors.black54],
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                      ),
-                    ),
+                // Right controls
+                if (!_isLocked)
+                  Positioned(
+                    right: 16,
+                    bottom: 100,
                     child: Column(
                       children: [
-                        // Seek bar
-                        Row(
-                          children: [
-                            Text(
-                              _formatDuration(position),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                              ),
-                            ),
-                            Expanded(
-                              child: Slider(
-                                value: position.inMilliseconds.toDouble(),
-                                max: duration.inMilliseconds.toDouble(),
-                                activeColor: const Color(0xFF00C853),
-                                inactiveColor: Colors.white24,
-                                onChanged: (value) {
-                                  _controller?.seekTo(
-                                    Duration(milliseconds: value.toInt()),
-                                  );
-                                },
-                              ),
-                            ),
-                            Text(
-                              _formatDuration(duration),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
+                        IconButton(
+                          icon: const Icon(
+                            Icons.screen_rotation,
+                            color: Colors.white,
+                          ),
+                          onPressed: _toggleOrientation,
                         ),
-                        // Controls
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                          children: [
-                            IconButton(
-                              icon: Icon(
-                                isPlaying
-                                    ? Icons.pause_circle_filled
-                                    : Icons.play_circle_filled,
-                                color: Colors.white,
-                                size: 40,
-                              ),
-                              onPressed: _togglePlayPause,
-                            ),
-                            IconButton(
-                              icon: const Icon(
-                                Icons.skip_previous,
-                                color: Colors.white54,
-                                size: 32,
-                              ),
-                              onPressed: null,
-                            ),
-                            IconButton(
-                              icon: const Icon(
-                                Icons.skip_next,
-                                color: Colors.white54,
-                                size: 32,
-                              ),
-                              onPressed: null,
-                            ),
-                            TextButton(
-                              onPressed: _showSpeedDialog,
-                              child: const Text(
-                                'Speed',
-                                style: TextStyle(color: Colors.white),
-                              ),
-                            ),
-                            IconButton(
-                              icon: const Icon(
-                                Icons.picture_in_picture_alt,
-                                color: Colors.white,
-                                size: 24,
-                              ),
-                              onPressed: () {},
-                            ),
-                          ],
+                        const SizedBox(height: 16),
+                        IconButton(
+                          icon: Icon(
+                            _isMuted ? Icons.volume_off : Icons.volume_up,
+                            color: Colors.white,
+                          ),
+                          onPressed: _toggleMute,
                         ),
                       ],
                     ),
                   ),
+
+                // Lock Button (Left Bottom)
+                Positioned(
+                  left: 16,
+                  bottom: 100,
+                  child: IconButton(
+                    icon: Icon(
+                      _isLocked ? Icons.lock : Icons.lock_open,
+                      color: Colors.white,
+                    ),
+                    onPressed: _toggleLock,
+                  ),
                 ),
-            ],
+
+                // Bottom Seek Bar
+                if (!_isLocked)
+                  Positioned(
+                    bottom: 40,
+                    left: 0,
+                    right: 0,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              Text(
+                                _formatDuration(position),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                              ),
+                              Expanded(
+                                child: Slider(
+                                  value: position.inMilliseconds
+                                      .toDouble()
+                                      .clamp(
+                                        0,
+                                        duration.inMilliseconds.toDouble(),
+                                      ),
+                                  min: 0,
+                                  max: duration.inMilliseconds.toDouble(),
+                                  activeColor: const Color(0xFF00C853),
+                                  inactiveColor: Colors.white24,
+                                  onChanged: (value) {
+                                    _player.seek(
+                                      Duration(milliseconds: value.toInt()),
+                                    );
+                                  },
+                                ),
+                              ),
+                              Text(
+                                _formatDuration(duration),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
-        ),
       ],
     );
   }
@@ -1383,10 +1543,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   Widget _buildBrightnessOverlay() {
+    final scale = MediaQuery.of(context).orientation == Orientation.landscape
+        ? 0.25
+        : 0.35;
     return Positioned(
       left: 30,
-      top: MediaQuery.of(context).size.height * 0.25,
-      bottom: MediaQuery.of(context).size.height * 0.25,
+      top: MediaQuery.of(context).size.height * scale,
+      bottom: MediaQuery.of(context).size.height * scale,
       child: Container(
         width: 50,
         padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
@@ -1423,10 +1586,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   Widget _buildVolumeOverlay() {
+    final scale = MediaQuery.of(context).orientation == Orientation.landscape
+        ? 0.25
+        : 0.35;
     return Positioned(
       right: 30,
-      top: MediaQuery.of(context).size.height * 0.25,
-      bottom: MediaQuery.of(context).size.height * 0.25,
+      top: MediaQuery.of(context).size.height * scale,
+      bottom: MediaQuery.of(context).size.height * scale,
       child: Container(
         width: 50,
         padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
@@ -1570,44 +1736,161 @@ class _OnlineSubtitleSearchContentState
       String? targetPath;
       if (widget.videoPath != null) {
         final dir = File(widget.videoPath!).parent.path;
-        final baseName = p.basenameWithoutExtension(widget.videoPath!);
-        targetPath = p.join(dir, '$baseName.srt');
+        // USE ORIGINAL FILENAME from the search result exactly as requested
+        String originalFileName =
+            item['filename'] ?? 'subtitle_${item['id']}.srt';
+
+        // Ensure it ends with .srt
+        String finalName = originalFileName;
+        if (!finalName.toLowerCase().endsWith('.srt')) {
+          finalName = '$finalName.srt';
+        }
+
+        targetPath = p.join(dir, finalName);
       }
 
-      if (targetPath == null) throw Exception('Target path not found');
+      if (targetPath == null)
+        throw Exception('Local target path could not be determined.');
 
       debugPrint('Downloading subtitle ${item['id']} to $targetPath');
-      final success = await widget.subtitleDownloadService.downloadSubtitle(
+      // This will now throw a descriptive Exception if it fails
+      await widget.subtitleDownloadService.downloadSubtitle(
         int.parse(item['id'].toString()),
         targetPath,
       );
 
       if (mounted) {
-        if (success) {
-          Navigator.pop(context); // Close panel
-          widget.onSubtitleDownloaded(targetPath);
-        } else {
-          setState(() => _downloadProgress = null);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Download failed'),
-              backgroundColor: Colors.redAccent,
-            ),
-          );
-        }
+        Navigator.pop(context); // Close panel
+        widget.onSubtitleDownloaded(targetPath);
       }
     } catch (e) {
       debugPrint('Download error: $e');
       if (mounted) {
         setState(() => _downloadProgress = null);
+
+        final errorStr = e.toString();
+        // Check if authentication is required (403 Forbidden)
+        if (errorStr.contains('403') || errorStr.contains('Unauthorized')) {
+          _showLoginDialog(onSuccess: () => _handleDownload(item));
+          return;
+        }
+
+        // Show the ACTUAL error message from the API or System
+        final displayError = errorStr.replaceFirst('Exception: ', '');
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Download error: $e'),
+            content: Text(displayError),
             backgroundColor: Colors.redAccent,
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'LOGIN',
+              textColor: Colors.white,
+              onPressed: () =>
+                  _showLoginDialog(onSuccess: () => _handleDownload(item)),
+            ),
           ),
         );
       }
     }
+  }
+
+  void _showLoginDialog({required VoidCallback onSuccess}) {
+    final usernameController = TextEditingController();
+    final passwordController = TextEditingController();
+    bool isLoggingIn = false;
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF1A1A1A),
+          title: const Text(
+            'OpenSubtitles Login',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'A free OpenSubtitles.com account is required for downloads.',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: usernameController,
+                decoration: InputDecoration(
+                  labelText: 'Username',
+                  labelStyle: const TextStyle(color: Colors.white54),
+                  filled: true,
+                  fillColor: Colors.white.withOpacity(0.05),
+                ),
+                style: const TextStyle(color: Colors.white),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: passwordController,
+                decoration: InputDecoration(
+                  labelText: 'Password',
+                  labelStyle: const TextStyle(color: Colors.white54),
+                  filled: true,
+                  fillColor: Colors.white.withOpacity(0.05),
+                ),
+                obscureText: true,
+                style: const TextStyle(color: Colors.white),
+              ),
+              if (isLoggingIn)
+                const Padding(
+                  padding: EdgeInsets.only(top: 16.0),
+                  child: CircularProgressIndicator(color: Color(0xFF00C853)),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text(
+                'Cancel',
+                style: TextStyle(color: Colors.white54),
+              ),
+            ),
+            ElevatedButton(
+              onPressed: isLoggingIn
+                  ? null
+                  : () async {
+                      setDialogState(() => isLoggingIn = true);
+                      final success = await widget.subtitleDownloadService
+                          .login(
+                            usernameController.text.trim(),
+                            passwordController.text,
+                          );
+                      if (mounted) {
+                        if (success) {
+                          Navigator.pop(context);
+                          onSuccess();
+                        } else {
+                          setDialogState(() => isLoggingIn = false);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                'Login failed. Please check your credentials.',
+                              ),
+                            ),
+                          );
+                        }
+                      }
+                    },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00C853),
+              ),
+              child: const Text(
+                'Login & Download',
+                style: TextStyle(color: Colors.white),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
