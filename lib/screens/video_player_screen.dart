@@ -16,6 +16,7 @@ import '../services/subtitle_service.dart';
 import '../models/subtitle_entry.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../widgets/side_panel.dart';
+import '../widgets/gesture_hud.dart';
 import '../services/dictionary_service.dart';
 import '../services/database_service.dart';
 import '../services/subtitle_download_service.dart';
@@ -78,6 +79,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   int _currentSubtitleIndex = 0;
   bool _subtitlesEnabled = false;
   String? _subtitleFileName;
+  // Full path of the loaded external SRT, captured so it can be persisted
+  // and restored across sessions. Null when using internal subtitles.
+  String? _subtitleFilePath;
   double _subtitleTextSize = 18.0;
   bool _isLearningMode = false;
   String? _selectedWord;
@@ -92,6 +96,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   String _seekPreviewText = '';
 
   String? _resolvedVideoPath;
+  // Captured once the video is opened; used as the key for per-video
+  // persistence (resume position, volume, subtitle prefs).
+  String? _currentVideoId;
 
   // Unified Subtitle State
   bool _useInternalSubtitles = true;
@@ -169,12 +176,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         if (tracks.isNotEmpty) {
           final text = tracks.first;
           if (_liveInternalCaption != text) {
-            setState(() => _liveInternalCaption = text);
+            // Optimistically reset the bookmark to the unsaved state so it
+            // never shows a stale "green" from the previous caption while
+            // the async DB lookup is in flight. The check below will flip
+            // it back to true iff this specific sentence is already saved.
+            setState(() {
+              _liveInternalCaption = text;
+              _isCurrentSentenceSaved = false;
+            });
+            _checkIfSentenceSaved(text);
           }
         } else {
           if (_liveInternalCaption != null &&
               _liveInternalCaption!.isNotEmpty) {
-            setState(() => _liveInternalCaption = "");
+            setState(() {
+              _liveInternalCaption = "";
+              _isCurrentSentenceSaved = false;
+            });
           }
         }
       }
@@ -192,6 +210,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       await _player.open(Media(file.path), play: false);
 
       final videoId = widget.videoFile?.id ?? widget.videoPath ?? 'unknown';
+      _currentVideoId = videoId;
 
       // Restore volume (MediaKit uses 0-100)
       double? savedVolume = await _historyService.getVolume(videoId);
@@ -248,8 +267,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
       await _player.play();
 
-      // Load subtitles (External)
-      await _loadSubtitles();
+      // Restore previously persisted subtitle prefs for this video, falling
+      // back to auto-discovery on first play.
+      await _restoreOrLoadSubtitles();
       // Initialize dictionary
       await DictionaryService().initialize();
 
@@ -460,7 +480,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     final screenHeight = MediaQuery.of(context).size.height;
     final isLeftSide = details.globalPosition.dx < screenWidth / 2;
 
-    final delta = -details.delta.dy / screenHeight;
+    // Sensitivity multiplier — without it a full-screen drag is required
+    // for a 0→100% sweep, which feels sluggish. 2.5x means roughly 40% of
+    // the screen height covers the full range.
+    const sensitivity = 2.5;
+    final delta = -details.delta.dy / screenHeight * sensitivity;
 
     if (isLeftSide && _initialBrightness != null) {
       // Brightness
@@ -630,6 +654,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           setState(() {
             _subtitles = subtitles;
             _subtitleFileName = fileName;
+            _subtitleFilePath = srtPath;
+            _useInternalSubtitles = false;
             _subtitlesEnabled = true; // Auto-enable subtitles when loaded
           });
         }
@@ -638,6 +664,87 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       // Silently fail if subtitle loading fails
       debugPrint('Subtitle loading failed: $e');
     }
+  }
+
+  // Restore subtitle prefs persisted for this video, or fall back to the
+  // existing auto-discover behavior the first time it's played. Either way
+  // the resulting state is persisted so subsequent sessions are seamless.
+  Future<void> _restoreOrLoadSubtitles() async {
+    final id = _currentVideoId;
+    final prefs = id != null
+        ? await _historyService.getSubtitlePrefs(id)
+        : null;
+
+    if (prefs == null) {
+      await _loadSubtitles();
+      _persistSubtitlePrefs();
+      return;
+    }
+
+    final enabled = prefs['enabled'] as bool? ?? false;
+    final useInternal = prefs['useInternal'] as bool? ?? true;
+    final srtPath = prefs['srtPath'] as String?;
+
+    // External SRT was previously selected for this video.
+    if (!useInternal && srtPath != null) {
+      final srtFile = File(srtPath);
+      if (await srtFile.exists()) {
+        try {
+          final subtitles = await SubtitleService.parseSRT(srtFile);
+          if (mounted) {
+            setState(() {
+              _subtitles = subtitles;
+              _subtitleFileName = srtPath.split(Platform.pathSeparator).last;
+              _subtitleFilePath = srtPath;
+              _useInternalSubtitles = false;
+              _subtitlesEnabled = enabled;
+            });
+          }
+          return;
+        } catch (e) {
+          debugPrint('Failed to parse saved subtitle: $e');
+        }
+      } else {
+        debugPrint('Saved subtitle file missing: $srtPath');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Saved subtitle file is missing. Please reselect.'),
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+      }
+      // Missing or unreadable — fall back to auto-discover only if the user
+      // had subtitles enabled, then re-persist whatever we ended up with.
+      if (enabled) {
+        await _loadSubtitles();
+      }
+      _persistSubtitlePrefs();
+      return;
+    }
+
+    // Internal-track preference: just restore the binary choice and the
+    // enabled flag. The player will surface its default internal track.
+    if (mounted) {
+      setState(() {
+        _useInternalSubtitles = true;
+        _subtitleFilePath = null;
+        _subtitlesEnabled = enabled;
+      });
+    }
+  }
+
+  // Snapshot the current subtitle state and persist it for this video.
+  void _persistSubtitlePrefs() {
+    final id = _currentVideoId;
+    if (id == null) return;
+    _historyService.saveSubtitlePrefs(
+      id,
+      enabled: _subtitlesEnabled,
+      useInternal: _useInternalSubtitles,
+      srtPath: _useInternalSubtitles ? null : _subtitleFilePath,
+    );
   }
 
   void _updateSubtitle() {
@@ -658,11 +765,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       final sub = _subtitles![i];
       if (position >= sub.start && position <= sub.end) {
         if (_currentSubtitle != sub) {
-          _checkIfSentenceSaved(sub.text);
+          // Optimistically clear the saved-state so the bookmark never
+          // shows stale "green" while the async lookup runs. The check
+          // below will set it back to true iff this exact sentence is
+          // already in the database.
           setState(() {
             _currentSubtitle = sub;
             _currentSubtitleIndex = i;
+            _isCurrentSentenceSaved = false;
           });
+          _checkIfSentenceSaved(sub.text);
         }
         return;
       }
@@ -769,6 +881,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                   _useInternalSubtitles = true;
                   _subtitles = null; // Clear external
                   _subtitleFileName = null;
+                  _subtitleFilePath = null;
                   _currentSubtitle = null;
                   _subtitlesEnabled = true;
 
@@ -777,6 +890,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
                   _liveInternalCaption = null; // Ghost fix
                 });
+                _persistSubtitlePrefs();
                 Navigator.pop(context);
               },
             );
@@ -835,9 +949,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                       setState(() {
                         _subtitles = null;
                         _subtitleFileName = null;
+                        _subtitleFilePath = null;
                         _useInternalSubtitles = true; // Revert to internal
                         _liveInternalCaption = null;
                       });
+                      _persistSubtitlePrefs();
                       Navigator.pop(context);
                     },
                   ),
@@ -848,6 +964,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                 _liveInternalCaption = null; // Ghost fix
                 _lastCapturedInternalCaption = null;
               });
+              _persistSubtitlePrefs();
               Navigator.pop(context);
             },
           ),
@@ -925,6 +1042,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                     value: _subtitlesEnabled,
                     onChanged: (value) {
                       setState(() => _subtitlesEnabled = value);
+                      _persistSubtitlePrefs();
                       setPanelState(() {});
                     },
                     activeColor: const Color(0xFF00C853),
@@ -1025,6 +1143,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       if (result != null && result.files.single.path != null) {
         final srtFile = File(result.files.single.path!);
         final fileName = result.files.single.name;
+        final srtPath = srtFile.path;
         debugPrint('Loading subtitle: $fileName');
         final subtitles = await SubtitleService.parseSRT(srtFile);
         if (mounted) {
@@ -1032,9 +1151,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             _subtitles = subtitles;
             _subtitlesEnabled = true;
             _subtitleFileName = fileName;
+            _subtitleFilePath = srtPath;
+            _useInternalSubtitles = false;
             _currentSubtitleIndex = 0;
             _currentSubtitle = null;
           });
+          _persistSubtitlePrefs();
         }
       }
     } catch (e, stackTrace) {
@@ -1065,9 +1187,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                 _subtitles = subtitles;
                 _subtitlesEnabled = true;
                 _subtitleFileName = p.basename(path);
+                _subtitleFilePath = path;
+                _useInternalSubtitles = false;
                 _currentSubtitleIndex = 0;
                 _currentSubtitle = null;
               });
+              _persistSubtitlePrefs();
 
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(
@@ -1083,7 +1208,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     );
   }
 
-  void _onWordTap(String word) {
+  void _onWordTap(String word, String sentence) {
     debugPrint('Word tapped: $word');
     _player.pause();
     setState(() => _selectedWord = word);
@@ -1096,9 +1221,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     final definition = DictionaryService().lookup(word);
 
     // Save to history if found (Fire and forget)
-    // Use normalizedWord so simple & capitalized versions map to same entry
+    // Use normalizedWord so simple & capitalized versions map to same entry.
+    // Persist the full subtitle line verbatim alongside the word.
     if (definition != null) {
-      DatabaseService().upsertWord(normalizedWord, definition);
+      DatabaseService().upsertWord(
+        normalizedWord,
+        definition,
+        sentence: sentence,
+      );
     }
 
     // Show word definition in side panel
@@ -1292,8 +1422,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                   if (_seekFeedback != null) _buildSeekFeedback(),
                   if (_isSeeking) _buildSeekOverlay(),
                   if (_isLongPressing) _build2xSpeedIndicator(),
-                  if (_showBrightnessOverlay) _buildBrightnessOverlay(),
-                  if (_showVolumeOverlay) _buildVolumeOverlay(),
+                  if (_showBrightnessOverlay)
+                    GestureHud(
+                      icon: Icons.wb_sunny_outlined,
+                      value: _currentBrightness ?? 0.5,
+                    ),
+                  if (_showVolumeOverlay)
+                    GestureHud(
+                      icon: (_currentVolume ?? 0) <= 0
+                          ? Icons.volume_off
+                          : Icons.volume_up,
+                      value: _currentVolume ?? 1.0,
+                    ),
 
                   // Subtitles
                   if (_subtitlesEnabled)
@@ -1537,96 +1677,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
               fontWeight: FontWeight.bold,
             ),
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildBrightnessOverlay() {
-    final scale = MediaQuery.of(context).orientation == Orientation.landscape
-        ? 0.25
-        : 0.35;
-    return Positioned(
-      left: 30,
-      top: MediaQuery.of(context).size.height * scale,
-      bottom: MediaQuery.of(context).size.height * scale,
-      child: Container(
-        width: 50,
-        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
-        decoration: BoxDecoration(
-          color: const Color.fromARGB(179, 0, 0, 0),
-          borderRadius: BorderRadius.circular(25),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.brightness_6, color: Colors.white, size: 24),
-            const SizedBox(height: 8),
-            Expanded(
-              child: RotatedBox(
-                quarterTurns: -1,
-                child: LinearProgressIndicator(
-                  value: _currentBrightness ?? 0.5,
-                  backgroundColor: Colors.white24,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    Color(0xFF00C853),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              '${((_currentBrightness ?? 0.5) * 100).toInt()}%',
-              style: const TextStyle(color: Colors.white, fontSize: 11),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildVolumeOverlay() {
-    final scale = MediaQuery.of(context).orientation == Orientation.landscape
-        ? 0.25
-        : 0.35;
-    return Positioned(
-      right: 30,
-      top: MediaQuery.of(context).size.height * scale,
-      bottom: MediaQuery.of(context).size.height * scale,
-      child: Container(
-        width: 50,
-        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
-        decoration: BoxDecoration(
-          color: const Color.fromARGB(179, 0, 0, 0),
-          borderRadius: BorderRadius.circular(25),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              _currentVolume == 0 ? Icons.volume_off : Icons.volume_up,
-              color: Colors.white,
-              size: 24,
-            ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: RotatedBox(
-                quarterTurns: -1,
-                child: LinearProgressIndicator(
-                  value: _currentVolume ?? 1.0,
-                  backgroundColor: Colors.white24,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    Color(0xFF00C853),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              '${((_currentVolume ?? 1.0) * 100).toInt()}%',
-              style: const TextStyle(color: Colors.white, fontSize: 11),
-            ),
-          ],
         ),
       ),
     );

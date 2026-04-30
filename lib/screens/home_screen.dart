@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show MethodCall;
 import 'package:photo_manager/photo_manager.dart';
 import '../services/history_service.dart';
 import '../widgets/history_item.dart';
@@ -13,7 +15,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<AssetEntity> _videos = [];
   List<AssetEntity> _historyVideos = [];
   // Watched fraction (0.0–1.0) per video id, updated alongside _historyVideos.
@@ -21,6 +23,9 @@ class _HomeScreenState extends State<HomeScreen> {
   List<AssetPathEntity> _folders = [];
   bool _isLoading = true;
   final HistoryService _historyService = HistoryService();
+  // Coalesces bursts of MediaStore change notifications into a single
+  // re-fetch (Android's scanner often fires multiple events per change).
+  Timer? _refreshDebounce;
 
   @override
   void initState() {
@@ -28,6 +33,14 @@ class _HomeScreenState extends State<HomeScreen> {
     // React to history writes from anywhere in the app so the History
     // strip refreshes in real-time (no n-1 lag from Navigator.pop).
     _historyService.addListener(_onHistoryChanged);
+    // Refresh when the app returns to the foreground (covers cases where
+    // the user added/removed videos via a file manager while we were
+    // backgrounded and the OS-level change notifier didn't fire to us).
+    WidgetsBinding.instance.addObserver(this);
+    // Subscribe to MediaStore changes so newly downloaded videos appear,
+    // and externally deleted videos disappear, without manual refresh.
+    PhotoManager.startChangeNotify();
+    PhotoManager.addChangeCallback(_onMediaStoreChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _fetchVideos();
     });
@@ -36,15 +49,34 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _historyService.removeListener(_onHistoryChanged);
+    PhotoManager.removeChangeCallback(_onMediaStoreChanged);
+    PhotoManager.stopChangeNotify();
+    WidgetsBinding.instance.removeObserver(this);
+    _refreshDebounce?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _fetchVideos(showLoading: false);
+    }
+  }
+
+  void _onMediaStoreChanged(MethodCall call) {
+    _refreshDebounce?.cancel();
+    _refreshDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (!mounted) return;
+      _fetchVideos(showLoading: false);
+    });
   }
 
   void _onHistoryChanged() {
     _loadHistory();
   }
 
-  Future<void> _fetchVideos() async {
-    setState(() => _isLoading = true);
+  Future<void> _fetchVideos({bool showLoading = true}) async {
+    if (showLoading) setState(() => _isLoading = true);
     try {
       final ps = await PhotoManager.requestPermissionExtend();
       if (!ps.isAuth && ps != PermissionState.limited) {
@@ -271,28 +303,33 @@ class _HomeScreenState extends State<HomeScreen> {
     // Grouping by date could be added here, currently single list for "Jan" etc.
     // For now, simpler implementation: Just a header "Jan" then items.
 
-    return ListView.builder(
-      padding: EdgeInsets.zero,
-      itemCount: _videos.length + 1, // +1 for Header
-      itemBuilder: (context, index) {
-        if (index == 0) {
-          return const Padding(
-            padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(
-              'Jan', // Hardcoded for now, dynamic date grouping would be next step
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
+    return RefreshIndicator(
+      color: const Color(0xFF00C853),
+      onRefresh: () => _fetchVideos(showLoading: false),
+      child: ListView.builder(
+        padding: EdgeInsets.zero,
+        physics: const AlwaysScrollableScrollPhysics(),
+        itemCount: _videos.length + 1, // +1 for Header
+        itemBuilder: (context, index) {
+          if (index == 0) {
+            return const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'Jan', // Hardcoded for now, dynamic date grouping would be next step
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-            ),
+            );
+          }
+          return VideoListItem(
+            video: _videos[index - 1],
+            onTap: () => _navigateToPlayer(_videos[index - 1]),
           );
-        }
-        return VideoListItem(
-          video: _videos[index - 1],
-          onTap: () => _navigateToPlayer(_videos[index - 1]),
-        );
-      },
+        },
+      ),
     );
   }
 

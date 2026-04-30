@@ -76,6 +76,7 @@ class _WordsTab extends StatelessWidget {
               itemCount: history.length,
               itemBuilder: (context, index) {
                 final item = history[index];
+                final sentence = item['sentence'] as String?;
                 return Card(
                   color: const Color(0xFF1E1E1E),
                   margin: const EdgeInsets.symmetric(
@@ -93,14 +94,29 @@ class _WordsTab extends StatelessWidget {
                     ),
                     subtitle: Padding(
                       padding: const EdgeInsets.only(top: 4.0),
-                      child: Text(
-                        item['definition'].toString(),
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 14,
-                        ),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            item['definition'].toString(),
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 14,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          if (sentence != null && sentence.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              sentence,
+                              style: const TextStyle(
+                                color: Colors.white60,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
                     trailing: IconButton(

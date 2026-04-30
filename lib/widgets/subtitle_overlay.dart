@@ -5,7 +5,7 @@ class SubtitleOverlay extends StatelessWidget {
   final double fontSize;
   final bool isLearningMode;
   final String? selectedWord;
-  final Function(String)? onWordTap;
+  final Function(String word, String sentence)? onWordTap;
   final VoidCallback? onLongPress;
   final Function(String)? onSaveSentence;
   final bool isSaved;
@@ -92,7 +92,9 @@ class SubtitleOverlay extends StatelessWidget {
 
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTap: cleaned.isNotEmpty ? () => onWordTap?.call(cleaned) : null,
+          onTap: cleaned.isNotEmpty
+              ? () => onWordTap?.call(cleaned, displayText!)
+              : null,
           onLongPress: onLongPress,
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),

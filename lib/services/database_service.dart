@@ -22,13 +22,14 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE vocabulary_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             word TEXT UNIQUE,
             definition TEXT,
+            sentence TEXT,
             created_at INTEGER
           )
         ''');
@@ -69,6 +70,15 @@ class DatabaseService {
             debugPrint('Columns might already exist: $e');
           }
         }
+        if (oldVersion < 4) {
+          try {
+            await db.execute(
+              'ALTER TABLE vocabulary_history ADD COLUMN sentence TEXT',
+            );
+          } catch (e) {
+            debugPrint('Column might already exist: $e');
+          }
+        }
       },
     );
   }
@@ -81,13 +91,17 @@ class DatabaseService {
   Stream<void> get onSentencesChanged => _sentencesStreamController.stream;
 
   // Fire and forget upsert
-  Future<void> upsertWord(String word, String definition) async {
+  Future<void> upsertWord(
+    String word,
+    String definition, {
+    String? sentence,
+  }) async {
     try {
       final db = await database;
       // INSERT OR REPLACE Logic
       await db.rawInsert(
-        'INSERT OR REPLACE INTO vocabulary_history (word, definition, created_at) VALUES (?, ?, ?)',
-        [word, definition, DateTime.now().millisecondsSinceEpoch],
+        'INSERT OR REPLACE INTO vocabulary_history (word, definition, sentence, created_at) VALUES (?, ?, ?, ?)',
+        [word, definition, sentence, DateTime.now().millisecondsSinceEpoch],
       );
       _historyStreamController.add(null);
       debugPrint('Saved to history: $word');
